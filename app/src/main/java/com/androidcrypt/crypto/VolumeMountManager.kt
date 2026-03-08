@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.util.Log
+import com.androidcrypt.app.VolumeForegroundService
 
 /**
  * Manages mounted volumes and provides file system operations
@@ -77,6 +78,13 @@ object VolumeMountManager {
                 if (appContext == null) {
                     appContext = context.applicationContext
                 }
+                
+                // Start foreground service to keep process alive while
+                // DocumentsProvider is advertising mounted volume roots.
+                // Without this Android may freeze the process and kill it
+                // with "Sync transaction while frozen" when DocumentsUI
+                // sends binder calls to the frozen provider.
+                VolumeForegroundService.start(context.applicationContext)
             } else {
                 reader.unmount()
             }
@@ -140,6 +148,11 @@ object VolumeMountManager {
             // Notify DocumentsProvider
             appContext?.let { notifyDocumentsProviderChanged(it) }
             
+            // Stop foreground service when no volumes remain mounted
+            if (mountedVolumes.isEmpty()) {
+                appContext?.let { VolumeForegroundService.stop(it) }
+            }
+            
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
@@ -159,6 +172,9 @@ object VolumeMountManager {
         paths.forEach { path ->
             unmountCallbacks.forEach { callback -> callback(path) }
         }
+        
+        // Stop foreground service — no volumes remain
+        appContext?.let { VolumeForegroundService.stop(it) }
     }
     
     /**

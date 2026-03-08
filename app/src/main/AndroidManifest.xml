@@ -55,6 +55,13 @@
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Foreground service to keep process alive while volumes are mounted -->
+        <service
+            android:name="com.androidcrypt.app.VolumeForegroundService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>

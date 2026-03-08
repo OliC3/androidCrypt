@@ -39,8 +39,17 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
     
     // FAT sector cache - reduces disk I/O during cluster chain traversal
     // Using ConcurrentHashMap for thread safety during parallel reads
+    // Stores entire prefetch buffers (32 sectors = 16KB each), keyed by aligned start sector.
+    // Reading a specific sector computes the containing block and offset within it.
+    private val fatBlockCache = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
+    private val fatBlockSectors = 32 // Number of sectors per cached block
+    private val maxFatBlockCacheSize = 64 // Cache up to 64 blocks (64×16KB = 1MB, covers 131072 clusters)
+    
+    // Per-sector cache for write operations (individual FAT sectors that were modified)
+    // Write-path methods modify individual sectors and cache them here.
+    // Read path checks fatSectorCache first (for dirty sectors), then falls back to fatBlockCache.
     private val fatSectorCache = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
-    private val maxFatCacheSize = 256 // Cache up to 256 FAT sectors (128KB typical) for better performance
+    private val maxFatCacheSize = 1024
     
     // Track last allocated cluster to avoid re-scanning from beginning
     @Volatile
@@ -65,7 +74,16 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
      * Normalize path for cache keys - FAT32 is case-insensitive
      */
     private fun normalizePath(path: String): String {
-        return path.lowercase().trimEnd('/')
+        // Fast path: if already lowercase and no trailing slash, return as-is (no allocation)
+        val len = path.length
+        if (len == 0) return path
+        var needsWork = path[len - 1] == '/'
+        if (!needsWork) {
+            for (i in 0 until len) {
+                if (path[i] in 'A'..'Z') { needsWork = true; break }
+            }
+        }
+        return if (needsWork) path.lowercase().trimEnd('/') else path
     }
     
     /**
@@ -83,6 +101,9 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
     fun clearCache() {
         directoryCache.clear()
         fileCache.clear()
+        fatBlockCache.clear()
+        fatSectorCache.clear()
+        clusterChainCache.clear()
     }
     
     // Lock for write operations to prevent race conditions
@@ -176,6 +197,38 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             if (DEBUG_LOGGING) Log.d(TAG, "File system detected: ${fsInfo?.type}, Label: ${fsInfo?.label}, Cluster size: $clusterSize")
             
+            // Compute total clusters for FSInfo validation and logging
+            val totalClustersComputed = ((totalSectors - (reservedSectors + (numberOfFATs.toLong() * sectorsPerFAT))) / sectorsPerCluster).toInt()
+            
+            // Read FSInfo sector (sector 1 typically) to get the free cluster hint
+            // This avoids scanning the entire FAT from cluster 2 on first allocation
+            try {
+                val fsInfoSectorNum = buffer.getShort(48).toInt() and 0xFFFF // FSInfo sector number
+                if (fsInfoSectorNum in 1..reservedSectors) {
+                    val fsInfoData = volumeReader.readSector(fsInfoSectorNum.toLong()).getOrNull()
+                    if (fsInfoData != null) {
+                        val fsInfoBuf = ByteBuffer.wrap(fsInfoData).order(ByteOrder.LITTLE_ENDIAN)
+                        val leadSig = fsInfoBuf.getInt(0)
+                        val structSig = fsInfoBuf.getInt(484)
+                        if (leadSig == 0x41615252 && structSig == 0x61417272) {
+                            val nxtFree = fsInfoBuf.getInt(492)
+                            val freeCount = fsInfoBuf.getInt(488)
+                            if (nxtFree in 2..totalClustersComputed && nxtFree != -1) {
+                                lastAllocatedCluster = nxtFree
+                                Log.d(TAG, "FSInfo: nxtFree=$nxtFree, freeCount=$freeCount")
+                            }
+                            if (freeCount >= 0 && freeCount != -1) {
+                                cachedFreeClusters = freeCount
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to read FSInfo sector, will scan from cluster 2", e)
+            }
+            
+            Log.d(TAG, "FAT32 initialized: totalClusters=$totalClustersComputed, lastAllocatedCluster=$lastAllocatedCluster")
+            
             Result.success(fsInfo!!)
             
         } catch (e: Exception) {
@@ -195,7 +248,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         synchronized(getDirectoryLock(path)) {
             // Double-check cache after acquiring lock (another thread may have populated it)
             directoryCache[cacheKey]?.let { 
-                Log.d(TAG, "LISTDIR: '$path' cache hit after lock (${System.currentTimeMillis() - listStart}ms)")
+                if (DEBUG_LOGGING) Log.d(TAG, "LISTDIR: cache hit after lock (${System.currentTimeMillis() - listStart}ms)")
                 return Result.success(it) 
             }
             
@@ -218,11 +271,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 
                 val entries = readDirectoryCluster(cluster, path)
                 directoryCache[cacheKey] = entries
-                Log.d(TAG, "LISTDIR: '$path' loaded ${entries.size} entries in ${System.currentTimeMillis() - listStart}ms")
+                if (DEBUG_LOGGING) Log.d(TAG, "LISTDIR: loaded ${entries.size} entries in ${System.currentTimeMillis() - listStart}ms")
                 Result.success(entries)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to list directory: $path", e)
+                Log.e(TAG, "Failed to list directory", e)
                 Result.failure(e)
             }
         }
@@ -231,179 +284,215 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
     private fun readDirectoryCluster(startCluster: Int, parentPath: String = "/"): List<FileEntry> {
         val bs = bootSector ?: return emptyList()
         val entries = mutableListOf<FileEntry>()
-        
+
         try {
             val firstDataSector = bs.reservedSectors + (bs.numberOfFATs * bs.sectorsPerFAT)
-            var currentCluster = startCluster
-            var lfnName = ""
-            var clusterCount = 0
-            
-            if (DEBUG_LOGGING) Log.d(TAG, "readDirectoryCluster: Starting to read directory at cluster $startCluster for path $parentPath")
-            
-            // Follow the cluster chain for directories that span multiple clusters
-            while (currentCluster >= 2 && currentCluster < 0x0FFFFFF8) {
-                clusterCount++
-                val firstSectorOfCluster = ((currentCluster - 2) * bs.sectorsPerCluster) + firstDataSector
-                
-                // Read all sectors in this cluster in one bulk read
-                val clusterData = volumeReader.readSectors(firstSectorOfCluster.toLong(), bs.sectorsPerCluster).getOrNull()
-                    ?: break
-                
-                // Parse directory entries (32 bytes each)
-                var offset = 0
-                
-                while (offset < clusterData.size) {
-                    val firstByte = clusterData[offset].toInt() and 0xFF
-                    
-                    // End of entries in this cluster (0x00 means no more entries)
-                    // But we still need to check if there are more clusters in the chain
-                    if (firstByte == 0x00) {
-                        // Skip remaining entries in this cluster and move to next cluster
-                        break
-                    }
-                    
-                    // Deleted entry
-                    if (firstByte == 0xE5) {
-                        offset += 32
-                        continue
-                    }
-                    
-                    val attr = clusterData[offset + 11].toInt() and 0xFF
-                    
-                    // Long file name entry
-                    if (attr == ATTR_LONG_NAME) {
-                        lfnName = parseLongFileName(clusterData, offset) + lfnName
-                        offset += 32
-                        continue
-                    }
-                    
-                    // Skip volume label and hidden system files
-                    if ((attr and ATTR_VOLUME_ID) != 0) {
-                        offset += 32
-                        continue
-                    }
-                    
-                    // Parse short file name
-                    val shortName = parseShortFileName(clusterData, offset)
-                    val name = if (lfnName.isNotEmpty()) lfnName else shortName
-                    lfnName = ""
-                    
-                    // Skip "." and ".." entries
-                    if (name == "." || name == "..") {
-                        offset += 32
-                        continue
-                    }
-                    
-                    val isDirectory = (attr and ATTR_DIRECTORY) != 0
-                    val size = ByteBuffer.wrap(clusterData, offset + 28, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
-                    
-                    // Parse first cluster number (high word at offset 20, low word at offset 26)
-                    val clusterLo = ByteBuffer.wrap(clusterData, offset + 26, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-                    val clusterHi = ByteBuffer.wrap(clusterData, offset + 20, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-                    val entryFirstCluster = (clusterHi shl 16) or clusterLo
-                    
-                    // Parse date/time (simplified)
-                    val modDate = ByteBuffer.wrap(clusterData, offset + 24, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-                    val modTime = ByteBuffer.wrap(clusterData, offset + 22, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
-                    val lastModified = parseFATDateTime(modDate, modTime)
-                    
-                    val mimeType = if (isDirectory) {
-                        "vnd.android.document/directory"
-                    } else {
-                        guessMimeType(name)
-                    }
-                    
-                    // Build the full path
-                    val fullPath = if (parentPath == "/") "/$name" else "$parentPath/$name"
-                    
-                    entries.add(FileEntry(
-                        name = name,
-                        path = fullPath,
-                        isDirectory = isDirectory,
-                        size = size,
-                        lastModified = lastModified,
-                        mimeType = mimeType,
-                        firstCluster = entryFirstCluster
-                    ))
-                    
-                    offset += 32
-                }
-                
-                // Get next cluster in the chain from FAT - bypass cache to get fresh data
-                val prevCluster = currentCluster
-                currentCluster = readFATEntry(currentCluster, bypassCache = true).getOrElse { 
-                    if (DEBUG_LOGGING) Log.w(TAG, "readDirectoryCluster: Failed to read FAT entry for cluster $currentCluster")
-                    break 
-                }
-                if (DEBUG_LOGGING) Log.d(TAG, "readDirectoryCluster: Cluster $prevCluster -> next cluster $currentCluster (EOF check: ${currentCluster >= 0x0FFFFFF8})")
+            val clusterSize = bs.sectorsPerCluster * SECTOR_SIZE
+
+            // Phase 1: Walk the FAT chain to collect all cluster numbers.
+            // This is cheap — FAT sectors are aggressively cached after the first prefetch,
+            // so each readFATEntry() call is typically a HashMap lookup with no I/O.
+            val clusterChain = mutableListOf<Int>()
+            var c = startCluster
+            while (c >= 2 && c < 0x0FFFFFF8) {
+                clusterChain.add(c)
+                c = readFATEntry(c).getOrElse { break }
             }
-            
-            if (DEBUG_LOGGING) Log.d(TAG, "readDirectoryCluster: Read $clusterCount clusters, found ${entries.size} entries for $parentPath")
-            
+
+            if (clusterChain.isEmpty()) return entries
+
+            // Phase 2: Read all directory data in large contiguous batches.
+            // A freshly-formatted volume typically has the entire directory as one
+            // contiguous run, so this usually becomes a single readSectors() call
+            // instead of one call per cluster (potentially hundreds of calls).
+            val lfnParts = mutableListOf<String>()
+            var chainIndex = 0
+
+            while (chainIndex < clusterChain.size) {
+                // Find the length of the contiguous run starting at chainIndex
+                var runLength = 1
+                while (chainIndex + runLength < clusterChain.size &&
+                       clusterChain[chainIndex + runLength] == clusterChain[chainIndex + runLength - 1] + 1) {
+                    runLength++
+                }
+
+                val firstClusterInRun = clusterChain[chainIndex]
+                val runSectorStart = (firstClusterInRun - 2).toLong() * bs.sectorsPerCluster + firstDataSector
+                val sectorsToRead = runLength * bs.sectorsPerCluster
+
+                val runData = volumeReader.readSectors(runSectorStart, sectorsToRead).getOrNull() ?: break
+
+                // Parse entries cluster by cluster within the batch buffer.
+                // Honour the 0x00 rule: stop at the first 0x00 in each cluster
+                // (skip rest of that cluster) but continue to subsequent clusters.
+                for (clusterInRun in 0 until runLength) {
+                    val clusterBase = clusterInRun * clusterSize
+                    var offset = clusterBase
+
+                    while (offset < clusterBase + clusterSize) {
+                        val firstByte = runData[offset].toInt() and 0xFF
+
+                        // 0x00 = free entry. Skip rest of THIS cluster but keep going
+                        // through the FAT chain — valid entries may follow in later clusters.
+                        if (firstByte == 0x00) break
+
+                        // Deleted entry
+                        if (firstByte == 0xE5) { offset += 32; continue }
+
+                        val attr = runData[offset + 11].toInt() and 0xFF
+
+                        // Long file name entry — collect parts in order (reversed at assembly)
+                        if (attr == ATTR_LONG_NAME) {
+                            lfnParts.add(parseLongFileName(runData, offset))
+                            offset += 32; continue
+                        }
+
+                        // Skip volume label
+                        if ((attr and ATTR_VOLUME_ID) != 0) { offset += 32; continue }
+
+                        val shortName = parseShortFileName(runData, offset)
+                        // Assemble LFN from collected parts (stored newest-first, need reverse)
+                        val name = if (lfnParts.isNotEmpty()) {
+                            val sb = StringBuilder(lfnParts.size * 13)
+                            for (p in lfnParts.indices.reversed()) sb.append(lfnParts[p])
+                            sb.toString()
+                        } else shortName
+                        lfnParts.clear()
+
+                        if (name == "." || name == "..") { offset += 32; continue }
+
+                        val isDirectory = (attr and ATTR_DIRECTORY) != 0
+
+                        val size = ((runData[offset + 28].toInt() and 0xFF) or
+                                   ((runData[offset + 29].toInt() and 0xFF) shl 8) or
+                                   ((runData[offset + 30].toInt() and 0xFF) shl 16) or
+                                   ((runData[offset + 31].toInt() and 0xFF) shl 24)).toLong() and 0xFFFFFFFFL
+
+                        val clusterLo = (runData[offset + 26].toInt() and 0xFF) or
+                                        ((runData[offset + 27].toInt() and 0xFF) shl 8)
+                        val clusterHi = (runData[offset + 20].toInt() and 0xFF) or
+                                        ((runData[offset + 21].toInt() and 0xFF) shl 8)
+                        val entryFirstCluster = (clusterHi shl 16) or clusterLo
+
+                        val modDate = (runData[offset + 24].toInt() and 0xFF) or
+                                      ((runData[offset + 25].toInt() and 0xFF) shl 8)
+                        val modTime = (runData[offset + 22].toInt() and 0xFF) or
+                                      ((runData[offset + 23].toInt() and 0xFF) shl 8)
+                        val lastModified = parseFATDateTime(modDate, modTime)
+
+                        val mimeType = if (isDirectory) "vnd.android.document/directory"
+                                       else guessMimeType(name)
+
+                        val fullPath = if (parentPath == "/") "/$name" else "$parentPath/$name"
+
+                        val entry = FileEntry(
+                            name = name,
+                            path = fullPath,
+                            isDirectory = isDirectory,
+                            size = size,
+                            lastModified = lastModified,
+                            mimeType = mimeType,
+                            firstCluster = entryFirstCluster
+                        )
+                        entries.add(entry)
+                        // Pre-populate fileCache so getFileInfoWithCluster doesn't re-walk
+                        fileCache[normalizePath(fullPath)] = entry
+
+                        offset += 32
+                    }
+                }
+
+                chainIndex += runLength
+            }
+
+            if (DEBUG_LOGGING) Log.d(TAG, "readDirectoryCluster: cluster=$startCluster clusters=${clusterChain.size} entries=${entries.size}")
+
         } catch (e: Exception) {
             Log.e(TAG, "Error reading directory cluster $startCluster", e)
         }
-        
+
         return entries
     }
     
+    // Pre-cached charset to avoid Charset.forName() lookup per call
+    private val asciiCharset = Charsets.US_ASCII
+    
     private fun parseShortFileName(data: ByteArray, offset: Int): String {
-        val nameBytes = data.copyOfRange(offset, offset + 8)
-        val extBytes = data.copyOfRange(offset + 8, offset + 11)
-        
-        val name = String(nameBytes, Charset.forName("ASCII")).trim()
-        val ext = String(extBytes, Charset.forName("ASCII")).trim()
+        val name = String(data, offset, 8, asciiCharset).trimEnd()
+        val ext = String(data, offset + 8, 3, asciiCharset).trimEnd()
         
         return if (ext.isNotEmpty()) "$name.$ext" else name
     }
     
+    // Pre-allocated LFN character offsets (avoids creating a List each call)
+    private val lfnOffsets = intArrayOf(1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
+    
     private fun parseLongFileName(data: ByteArray, offset: Int): String {
-        val chars = mutableListOf<Char>()
+        val sb = StringBuilder(13) // LFN entry holds max 13 chars
         
-        // LFN entries have characters at specific offsets (Unicode LE)
-        val offsets = listOf(1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
-        
-        for (o in offsets) {
+        for (o in lfnOffsets) {
             if (offset + o + 1 < data.size) {
                 val c1 = data[offset + o].toInt() and 0xFF
                 val c2 = data[offset + o + 1].toInt() and 0xFF
                 val char = ((c2 shl 8) or c1).toChar()
                 if (char == '\u0000' || char == '\uFFFF') break
-                chars.add(char)
+                sb.append(char)
             }
         }
         
-        return chars.joinToString("")
+        return sb.toString()
+    }
+    
+    // Days from Jan 1 to the start of each month (non-leap year)
+    private val DAYS_BEFORE_MONTH = intArrayOf(0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+
+    // Precomputed cumulative days from Unix epoch (1970-01-01) to Jan 1 of each year.
+    // FAT dates encode years 1980–2107 (7-bit field), so index 0 = 1970, index 137 = 2107.
+    // This replaces the per-entry loop ("for (y in 1970 until year)") with a single table lookup.
+    private val DAYS_TO_YEAR: IntArray = IntArray(138).also { table ->
+        var acc = 0
+        for (y in 1970..2107) {
+            table[y - 1970] = acc
+            acc += if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) 366 else 365
+        }
     }
     
     private fun parseFATDateTime(date: Int, time: Int): Long {
         // FAT date: bits 15-9: year (1980+), 8-5: month, 4-0: day
         // FAT time: bits 15-11: hour, 10-5: minute, 4-0: second/2
         val year = 1980 + ((date shr 9) and 0x7F)
-        val month = (date shr 5) and 0x0F
-        val day = date and 0x1F
+        val month = ((date shr 5) and 0x0F).coerceIn(1, 12)
+        val day = (date and 0x1F).coerceAtLeast(1)
         val hour = (time shr 11) and 0x1F
         val minute = (time shr 5) and 0x3F
         val second = (time and 0x1F) * 2
         
-        // Convert to Unix timestamp (simplified, ignores timezone)
-        return java.util.Calendar.getInstance().apply {
-            set(year, month - 1, day, hour, minute, second)
-        }.timeInMillis
+        // Convert to Unix epoch millis using precomputed table (single array lookup, no loop)
+        var days = DAYS_TO_YEAR[year - 1970].toLong()
+        days += DAYS_BEFORE_MONTH[month - 1]
+        // Add leap day if applicable
+        if (month > 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) days++
+        days += day - 1
+        
+        return (days * 86400L + hour * 3600L + minute * 60L + second) * 1000L
     }
     
     private fun guessMimeType(fileName: String): String {
-        val ext = fileName.substringAfterLast('.', "").lowercase()
-        return when (ext) {
-            "txt", "log" -> "text/plain"
-            "pdf" -> "application/pdf"
-            "jpg", "jpeg" -> "image/jpeg"
-            "png" -> "image/png"
-            "gif" -> "image/gif"
-            "mp4" -> "video/mp4"
-            "mp3" -> "audio/mpeg"
-            "zip" -> "application/zip"
-            "doc", "docx" -> "application/msword"
+        // Use endsWith with ignoreCase instead of allocating a lowercase extension string
+        return when {
+            fileName.endsWith(".txt", ignoreCase = true) ||
+            fileName.endsWith(".log", ignoreCase = true) -> "text/plain"
+            fileName.endsWith(".pdf", ignoreCase = true) -> "application/pdf"
+            fileName.endsWith(".jpg", ignoreCase = true) ||
+            fileName.endsWith(".jpeg", ignoreCase = true) -> "image/jpeg"
+            fileName.endsWith(".png", ignoreCase = true) -> "image/png"
+            fileName.endsWith(".gif", ignoreCase = true) -> "image/gif"
+            fileName.endsWith(".mp4", ignoreCase = true) -> "video/mp4"
+            fileName.endsWith(".mp3", ignoreCase = true) -> "audio/mpeg"
+            fileName.endsWith(".zip", ignoreCase = true) -> "application/zip"
+            fileName.endsWith(".doc", ignoreCase = true) ||
+            fileName.endsWith(".docx", ignoreCase = true) -> "application/msword"
+            fileName.endsWith(".valv", ignoreCase = true) -> "application/octet-stream"
             else -> "application/octet-stream"
         }
     }
@@ -430,7 +519,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 if (fileInfo.size == 0L) {
                     return Result.success(ByteArray(0))
                 }
-                Log.e(TAG, "readFile: File '$path' has size=${fileInfo.size} but no clusters allocated!")
+                Log.e(TAG, "readFile: File has size=${fileInfo.size} but no clusters allocated!")
                 return Result.failure(Exception("File has no clusters allocated but size is ${fileInfo.size}"))
             }
             
@@ -487,10 +576,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 
                 // Read all consecutive clusters in one I/O operation
                 val firstClusterInBatch = clusterChain[chainIndex]
-                val batchSectorStart = firstDataSector + ((firstClusterInBatch - 2) * bs.sectorsPerCluster)
+                val batchSectorStart = firstDataSector.toLong() + (firstClusterInBatch - 2).toLong() * bs.sectorsPerCluster
                 val sectorsToRead = runLength * bs.sectorsPerCluster
                 
-                val batchData = volumeReader.readSectors(batchSectorStart.toLong(), sectorsToRead).getOrThrow()
+                val batchData = volumeReader.readSectors(batchSectorStart, sectorsToRead).getOrThrow()
                 
                 // Copy only actual file data (not padding)
                 val bytesToCopy = minOf(batchData.size, actualFileSize.toInt() - bytesRead)
@@ -505,7 +594,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             Result.success(fileData)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to read file: $path", e)
+            Log.e(TAG, "Failed to read file", e)
             Result.failure(e)
         }
     }
@@ -518,46 +607,55 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             // Calculate which FAT sector contains this cluster entry
             val entryOffset = cluster * 4
             val fatSectorOffset = entryOffset / SECTOR_SIZE
-            val offsetInSector = entryOffset % SECTOR_SIZE
             
-            val fatSector: ByteArray
+            // Align to block boundary for cache lookup
+            val blockStart = (fatSectorOffset / fatBlockSectors) * fatBlockSectors
+            val offsetInBlock = (fatSectorOffset - blockStart) * SECTOR_SIZE + (entryOffset % SECTOR_SIZE)
+            
+            val block: ByteArray
             if (bypassCache) {
                 // Read fresh from disk, then update cache
-                fatSector = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
-                fatSectorCache[fatSectorOffset] = fatSector
+                val freshData = volumeReader.readSectors((fatStartSector + blockStart).toLong(), fatBlockSectors).getOrThrow()
+                fatBlockCache[blockStart] = freshData
+                block = freshData
             } else {
-                // Check FAT sector cache first - ConcurrentHashMap handles thread safety
-                fatSector = fatSectorCache[fatSectorOffset] ?: run {
-                    // Evict some entries if cache is full (approximate, doesn't need to be exact)
-                    if (fatSectorCache.size >= maxFatCacheSize) {
-                        val keysToRemove = fatSectorCache.keys.take(maxFatCacheSize / 4)
-                        keysToRemove.forEach { fatSectorCache.remove(it) }
+                block = fatBlockCache[blockStart] ?: run {
+                    // Evict some entries if cache is full
+                    if (fatBlockCache.size >= maxFatBlockCacheSize) {
+                        val keysToRemove = fatBlockCache.keys.take(maxFatBlockCacheSize / 4)
+                        keysToRemove.forEach { fatBlockCache.remove(it) }
                     }
                     
-                    // Pre-fetch multiple FAT sectors at once (32 sectors = 16KB, covers 4096 clusters)
-                    val prefetchCount = 32
-                    val prefetchData = volumeReader.readSectors(
-                        (fatStartSector + fatSectorOffset).toLong(), 
-                        prefetchCount
+                    // Read entire block (32 sectors = 16KB, covers 4096 clusters) in one I/O
+                    val blockData = volumeReader.readSectors(
+                        (fatStartSector + blockStart).toLong(),
+                        fatBlockSectors
                     ).getOrNull()
                     
-                    if (prefetchData != null) {
-                        // Cache all prefetched sectors
-                        for (i in 0 until prefetchCount) {
-                            val sectorData = prefetchData.copyOfRange(i * SECTOR_SIZE, (i + 1) * SECTOR_SIZE)
-                            fatSectorCache.putIfAbsent(fatSectorOffset + i, sectorData)
-                        }
-                        fatSectorCache[fatSectorOffset]!!
+                    if (blockData != null) {
+                        fatBlockCache.putIfAbsent(blockStart, blockData) ?: blockData
                     } else {
                         // Fallback to single sector read
-                        val newSector = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
-                        fatSectorCache.putIfAbsent(fatSectorOffset, newSector) ?: newSector
+                        val singleSector = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
+                        // Don't cache partial block
+                        return@run singleSector.also {
+                            // offsetInBlock needs to be relative to this single sector
+                            val b0 = it[entryOffset % SECTOR_SIZE].toInt() and 0xFF
+                            val b1 = it[(entryOffset % SECTOR_SIZE) + 1].toInt() and 0xFF
+                            val b2 = it[(entryOffset % SECTOR_SIZE) + 2].toInt() and 0xFF
+                            val b3 = it[(entryOffset % SECTOR_SIZE) + 3].toInt() and 0xFF
+                            return Result.success((b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)) and 0x0FFFFFFF)
+                        }
                     }
                 }
             }
             
-            // Read FAT entry (4 bytes for FAT32)
-            val entry = ByteBuffer.wrap(fatSector, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).int and 0x0FFFFFFF
+            // Read FAT entry (4 bytes for FAT32) - direct byte read from block buffer
+            val b0 = block[offsetInBlock].toInt() and 0xFF
+            val b1 = block[offsetInBlock + 1].toInt() and 0xFF
+            val b2 = block[offsetInBlock + 2].toInt() and 0xFF
+            val b3 = block[offsetInBlock + 3].toInt() and 0xFF
+            val entry = (b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)) and 0x0FFFFFFF
             
             Result.success(entry)
         } catch (e: Exception) {
@@ -579,14 +677,31 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             if (fileInfo.isDirectory) {
                 return Result.failure(Exception("Path is a directory, not a file"))
             }
+            readFileRangeByCluster(fileInfo.firstCluster, fileInfo.size, offset, length)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read file range at offset $offset, length $length", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Read a range of bytes from a file using a pre-resolved firstCluster.
+     * Skips the directory-traversal metadata lookup on every call.
+     * Use when the caller already knows the firstCluster (e.g. ProxyCallback).
+     */
+    fun readFileRangeByCluster(firstCluster: Int, fileSize: Long, offset: Long, length: Int): Result<ByteArray> {
+        return try {
+            if (firstCluster < 2) {
+                return Result.failure(Exception("Invalid first cluster"))
+            }
             
             val bs = bootSector ?: return Result.failure(Exception("File system not initialized"))
             val clusterSize = bs.sectorsPerCluster * SECTOR_SIZE
             val firstDataSector = bs.reservedSectors + (bs.numberOfFATs * bs.sectorsPerFAT)
             
             // Clamp to file size
-            val actualLength = minOf(length.toLong(), fileInfo.size - offset).toInt()
-            if (actualLength <= 0 || offset >= fileInfo.size) {
+            val actualLength = minOf(length.toLong(), fileSize - offset).toInt()
+            if (actualLength <= 0 || offset >= fileSize) {
                 return Result.success(ByteArray(0))
             }
             
@@ -596,7 +711,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             val clustersNeeded = endClusterIndex - startClusterIndex + 1
             
             // Build cluster chain (or use cached one if we already have it)
-            val clusterChain = getClusterChain(fileInfo.firstCluster, endClusterIndex + 1)
+            val clusterChain = getClusterChain(firstCluster, endClusterIndex + 1)
             
             if (startClusterIndex >= clusterChain.size) {
                 return Result.success(ByteArray(0))
@@ -610,56 +725,40 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             while (i <= minOf(endClusterIndex, clusterChain.size - 1) && bytesRemaining > 0) {
                 val cluster = clusterChain[i]
-                val clusterStartOffset = i.toLong() * clusterSize
                 
-                // Calculate offset within this cluster
+                // Calculate offset within this cluster (only non-zero for the very first)
                 val offsetInCluster = if (i == startClusterIndex) {
-                    (offset - clusterStartOffset).toInt()
+                    (offset - i.toLong() * clusterSize).toInt()
                 } else 0
                 
-                // Calculate how many bytes to read from this cluster
-                val bytesInCluster = minOf(clusterSize - offsetInCluster, bytesRemaining)
-                
-                // Check if we can batch consecutive clusters (only if starting at cluster boundary)
+                // Always try to batch consecutive clusters — even when the first
+                // cluster has a non-zero offset.  We read the full batch and then
+                // copy starting at offsetInCluster.  This turns 2 I/O calls
+                // (partial first + batch of rest) into a single one.
                 var consecutiveCount = 1
-                if (offsetInCluster == 0) {
-                    while (i + consecutiveCount <= endClusterIndex && 
-                           i + consecutiveCount < clusterChain.size &&
-                           clusterChain[i + consecutiveCount] == cluster + consecutiveCount &&
-                           consecutiveCount < 64) { // Max 64 clusters per batch
-                        consecutiveCount++
-                    }
+                while (i + consecutiveCount <= endClusterIndex &&
+                       i + consecutiveCount < clusterChain.size &&
+                       clusterChain[i + consecutiveCount] == cluster + consecutiveCount &&
+                       consecutiveCount < 64) {
+                    consecutiveCount++
                 }
                 
-                if (consecutiveCount > 1) {
-                    // Read multiple consecutive clusters at once
-                    val batchSectorStart = firstDataSector + ((cluster - 2) * bs.sectorsPerCluster)
-                    val sectorsToRead = consecutiveCount * bs.sectorsPerCluster
-                    val batchData = volumeReader.readSectors(batchSectorStart.toLong(), sectorsToRead).getOrThrow()
-                    
-                    val bytesToCopy = minOf(batchData.size, bytesRemaining)
-                    System.arraycopy(batchData, 0, result, resultOffset, bytesToCopy)
-                    resultOffset += bytesToCopy
-                    bytesRemaining -= bytesToCopy
-                    
-                    // Skip past the clusters we just read
-                    i += consecutiveCount
-                } else {
-                    // Read single cluster
-                    val sectorStart = firstDataSector + ((cluster - 2) * bs.sectorsPerCluster)
-                    val clusterData = volumeReader.readSectors(sectorStart.toLong(), bs.sectorsPerCluster).getOrThrow()
-                    
-                    System.arraycopy(clusterData, offsetInCluster, result, resultOffset, bytesInCluster)
-                    resultOffset += bytesInCluster
-                    bytesRemaining -= bytesInCluster
-                    
-                    i++
-                }
+                // Use Long arithmetic to avoid int overflow on large volumes
+                val batchSectorStart = firstDataSector.toLong() + (cluster - 2).toLong() * bs.sectorsPerCluster
+                val sectorsToRead = consecutiveCount * bs.sectorsPerCluster
+                val batchData = volumeReader.readSectors(batchSectorStart, sectorsToRead).getOrThrow()
+                
+                val bytesToCopy = minOf(batchData.size - offsetInCluster, bytesRemaining)
+                System.arraycopy(batchData, offsetInCluster, result, resultOffset, bytesToCopy)
+                resultOffset += bytesToCopy
+                bytesRemaining -= bytesToCopy
+                
+                i += consecutiveCount
             }
             
             Result.success(result)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to read file range: $path at offset $offset, length $length", e)
+            Log.e(TAG, "Failed to read file range at offset $offset, length $length", e)
             Result.failure(e)
         }
     }
@@ -668,25 +767,27 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
     private val clusterChainCache = java.util.concurrent.ConcurrentHashMap<Int, List<Int>>()
     
     private fun getClusterChain(firstCluster: Int, maxClusters: Int): List<Int> {
-        // Check cache
+        // Return from cache if it already covers what we need
         clusterChainCache[firstCluster]?.let { cached ->
-            if (cached.size >= maxClusters) return cached.take(maxClusters)
+            if (cached.size >= maxClusters) return cached
         }
         
-        // Build chain
+        // Build the COMPLETE chain to EOF — no maxClusters cap here.
+        // FAT entries are all cached after the first directory read, so traversal
+        // is pure in-memory HashMap lookups (~100ns each). Building 5000 entries
+        // for a 20MB file takes ~0.5ms and means every subsequent call is a cache hit.
         val chain = mutableListOf<Int>()
         var cluster = firstCluster
-        while (cluster >= 2 && cluster < 0x0FFFFFF8 && chain.size < maxClusters) {
+        while (cluster >= 2 && cluster < 0x0FFFFFF8) {
             chain.add(cluster)
             cluster = readFATEntry(cluster).getOrElse { break }
         }
         
-        // Cache it
         clusterChainCache[firstCluster] = chain
         
         // Evict old entries if cache gets too large
-        if (clusterChainCache.size > 100) {
-            val keysToRemove = clusterChainCache.keys.take(50)
+        if (clusterChainCache.size > 200) {
+            val keysToRemove = clusterChainCache.keys.take(100)
             keysToRemove.forEach { clusterChainCache.remove(it) }
         }
         
@@ -779,10 +880,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 
                 // Read all consecutive clusters in one I/O operation
                 val firstClusterInBatch = clusterChain[chainIndex]
-                val batchSectorStart = firstDataSector + ((firstClusterInBatch - 2) * bs.sectorsPerCluster)
+                val batchSectorStart = firstDataSector.toLong() + (firstClusterInBatch - 2).toLong() * bs.sectorsPerCluster
                 val sectorsToRead = runLength * bs.sectorsPerCluster
                 
-                val batchData = volumeReader.readSectors(batchSectorStart.toLong(), sectorsToRead).getOrThrow()
+                val batchData = volumeReader.readSectors(batchSectorStart, sectorsToRead).getOrThrow()
                 
                 // Write only the actual file data (not padding at end)
                 val bytesToWrite = minOf(batchData.size.toLong(), actualFileSize - bytesWritten).toInt()
@@ -795,8 +896,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             bufferedOutput.flush()
             val streamTime = System.currentTimeMillis() - streamStart
             val totalTime = System.currentTimeMillis() - totalStart
-            // Log timing breakdown - always log for debugging slow performance
-            Log.d(TAG, "STREAM: ${bytesWritten/1024}KB total=${totalTime}ms (fileInfo=${fileInfoTime}ms, fatChain=${fatChainTime}ms, stream=${streamTime}ms, clusters=${clusterChain.size})")
+            if (DEBUG_LOGGING) Log.d(TAG, "STREAM: ${bytesWritten/1024}KB total=${totalTime}ms (fileInfo=${fileInfoTime}ms, fatChain=${fatChainTime}ms, stream=${streamTime}ms, clusters=${clusterChain.size})")
             Result.success(bytesWritten)
             
         } catch (e: java.io.IOException) {
@@ -805,11 +905,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             if (isBrokenPipe) {
                 if (DEBUG_LOGGING) Log.d(TAG, "Stream closed by reader for: $path (normal for seeking)")
             } else {
-                Log.e(TAG, "Failed to stream file: $path", e)
+                Log.e(TAG, "Failed to stream file", e)
             }
             Result.failure(e)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to stream file: $path", e)
+            Log.e(TAG, "Failed to stream file", e)
             Result.failure(e)
         }
     }
@@ -847,6 +947,14 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+    
+    /**
+     * Get file info with firstCluster guaranteed to be populated.
+     * Use this when you need the cluster number for subsequent I/O.
+     */
+    fun getFileInfoWithClusterPublic(path: String): Result<FileEntry> {
+        return getFileInfoWithCluster(path)
     }
     
     /**
@@ -908,7 +1016,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to get file info with cluster: $path", e)
+            Log.e(TAG, "Failed to get file info with cluster", e)
             Result.failure(e)
         }
     }
@@ -928,8 +1036,21 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         )
     }
     
+    /**
+     * Holds the result of a metadata/allocation phase so the actual data writing
+     * can proceed outside the writeLock. This prevents ANR when multiple binder
+     * threads (e.g. DocumentsUI copy) contend on createFile while a write is in progress.
+     */
+    private data class WriteAllocation(
+        val clusters: List<Int>,
+        val firstDataSector: Int,
+        val clusterSize: Int,
+        val sectorsPerCluster: Int
+    )
+    
     override fun writeFile(path: String, data: ByteArray): Result<Unit> {
-        return writeLock.withLock {
+        // Phase 1: Metadata under writeLock (fast — allocates clusters, updates FAT & dir entry)
+        val allocationResult: Result<WriteAllocation> = writeLock.withLock {
             try {
                 val fileInfo = getFileInfo(path).getOrThrow()
                 if (fileInfo.isDirectory) {
@@ -969,14 +1090,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             var currentDirCluster = parentCluster
             outerLoop@ while (currentDirCluster >= 2 && currentDirCluster < 0x0FFFFFF8) {
-                val firstSectorOfCluster = ((currentDirCluster - 2) * bs.sectorsPerCluster) + firstDataSector
+                val firstSectorOfCluster = ((currentDirCluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
                 
-                // Read this directory cluster
-                val clusterData = ByteArray(bs.sectorsPerCluster * SECTOR_SIZE)
-                for (i in 0 until bs.sectorsPerCluster) {
-                    val sectorData = volumeReader.readSector(firstSectorOfCluster.toLong() + i).getOrThrow()
-                    System.arraycopy(sectorData, 0, clusterData, i * SECTOR_SIZE, SECTOR_SIZE)
-                }
+                // Read this directory cluster in one bulk read
+                val clusterData = volumeReader.readSectors(firstSectorOfCluster, bs.sectorsPerCluster).getOrThrow()
                 
                 var offset = 0
                 var lfnName = ""
@@ -1051,42 +1168,66 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             ByteBuffer.wrap(clusterData, dirEntryOffset + 28, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(data.size)
             
             // Write back modified directory cluster
-            for (i in 0 until bs.sectorsPerCluster) {
-                val sectorData = clusterData.copyOfRange(i * SECTOR_SIZE, (i + 1) * SECTOR_SIZE)
-                volumeReader.writeSector(firstSectorOfCluster + i, sectorData).getOrThrow()
-            }
+            volumeReader.writeSectors(firstSectorOfCluster, clusterData).getOrThrow()
             
             // Create cluster chain in FAT
             writeClusterChain(clusters)
             
-            // Write file data across clusters
+            Result.success(WriteAllocation(clusters, firstDataSector, clusterSize, bs.sectorsPerCluster))
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to write file (metadata phase)", e)
+                Result.failure(e)
+            }
+        }
+        
+        val allocation = allocationResult.getOrElse { return Result.failure(it) }
+        
+        // Phase 2: Write file data to allocated clusters (no lock needed —
+        // clusters are reserved in FAT so no other operation will use them)
+        return try {
             var dataOffset = 0
-            for (cluster in clusters) {
-                val clusterSector = firstDataSector + ((cluster - 2) * bs.sectorsPerCluster)
+            var clusterIndex = 0
+            // Reusable write buffer — grows if needed, avoids per-run allocation
+            var writeBuf: ByteArray? = null
+            
+            while (clusterIndex < allocation.clusters.size) {
+                // Find contiguous runs of clusters for batch writing
+                var contiguousCount = 1
+                while (clusterIndex + contiguousCount < allocation.clusters.size &&
+                       allocation.clusters[clusterIndex + contiguousCount] == allocation.clusters[clusterIndex + contiguousCount - 1] + 1) {
+                    contiguousCount++
+                }
+                
+                val batchBytes = contiguousCount * allocation.clusterSize
                 val remaining = data.size - dataOffset
-                val toWrite = minOf(remaining, clusterSize)
+                val toWrite = minOf(remaining, batchBytes)
                 
-                // Prepare cluster data (pad if needed)
-                val clusterBuffer = ByteArray(clusterSize)
-                System.arraycopy(data, dataOffset, clusterBuffer, 0, toWrite)
+                // Reuse buffer only if it's exactly the right size (writeSectors
+                // uses data.size to determine sector count)
+                if (writeBuf == null || writeBuf!!.size != batchBytes) {
+                    writeBuf = ByteArray(batchBytes)
+                } else if (toWrite < batchBytes) {
+                    // Zero-fill padding area (buffer may contain stale data from prior run)
+                    java.util.Arrays.fill(writeBuf!!, toWrite, batchBytes, 0.toByte())
+                }
+                System.arraycopy(data, dataOffset, writeBuf!!, 0, toWrite)
                 
-                // Write entire cluster in one bulk operation
-                volumeReader.writeSectors(clusterSector.toLong(), clusterBuffer).getOrThrow()
+                val firstCluster = allocation.clusters[clusterIndex]
+                val clusterSector = allocation.firstDataSector.toLong() + (firstCluster - 2).toLong() * allocation.sectorsPerCluster
+                volumeReader.writeSectors(clusterSector, writeBuf!!).getOrThrow()
                 
                 dataOffset += toWrite
+                clusterIndex += contiguousCount
             }
             
-            // Clear any cached info for this file since its size/contents changed
             fileCache.remove(path)
             directoryCache.clear()
-            // Invalidate free space cache
             invalidateFreeSpaceCache()
             
             Result.success(Unit)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to write file: $path", e)
-                Result.failure(e)
-            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write file (data phase)", e)
+            Result.failure(e)
         }
     }
     
@@ -1099,7 +1240,8 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         fileSize: Long,
         onProgress: ((Long) -> Unit)?
     ): Result<Unit> {
-        return writeLock.withLock {
+        // Phase 1: Metadata under writeLock (fast — allocates clusters, updates FAT & dir entry)
+        val allocationResult: Result<WriteAllocation> = writeLock.withLock {
             try {
                 val fileInfo = getFileInfo(path).getOrThrow()
                 if (fileInfo.isDirectory) {
@@ -1146,10 +1288,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 
                 var currentDirCluster = parentCluster
                 outerLoop@ while (currentDirCluster >= 2 && currentDirCluster < 0x0FFFFFF8) {
-                    val firstSectorOfCluster = ((currentDirCluster - 2) * bs.sectorsPerCluster) + firstDataSector
+                    val firstSectorOfCluster = ((currentDirCluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
                     
                     // Read this directory cluster in one bulk read
-                    val clusterData = volumeReader.readSectors(firstSectorOfCluster.toLong(), bs.sectorsPerCluster).getOrThrow()
+                    val clusterData = volumeReader.readSectors(firstSectorOfCluster, bs.sectorsPerCluster).getOrThrow()
                     
                     var offset = 0
                     var lfnName = ""
@@ -1176,7 +1318,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                         if (entryName.equals(fileName, ignoreCase = true)) {
                             dirEntryOffset = offset
                             foundClusterData = clusterData
-                            foundFirstSectorOfCluster = firstSectorOfCluster.toLong()
+                            foundFirstSectorOfCluster = firstSectorOfCluster
                             val clusterLo = java.nio.ByteBuffer.wrap(clusterData, offset + 26, 2).order(java.nio.ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
                             val clusterHi = java.nio.ByteBuffer.wrap(clusterData, offset + 20, 2).order(java.nio.ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
                             fileFirstCluster = (clusterHi shl 16) or clusterLo
@@ -1216,87 +1358,84 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 java.nio.ByteBuffer.wrap(clusterData, dirEntryOffset + 28, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN).putInt(fileSize.toInt())
                 
                 // Write back modified directory
-                for (i in 0 until bs.sectorsPerCluster) {
-                    val sectorData = clusterData.copyOfRange(i * SECTOR_SIZE, (i + 1) * SECTOR_SIZE)
-                    volumeReader.writeSector(firstSectorOfCluster.toLong() + i, sectorData).getOrThrow()
-                }
+                volumeReader.writeSectors(firstSectorOfCluster, clusterData).getOrThrow()
                 
                 // Create cluster chain in FAT
                 writeClusterChain(clusters)
                 
-                // Stream file data across clusters with larger buffer for performance
-                // Process 64 clusters (256KB typical) at a time for better throughput
-                val clustersPerBatch = 64
-                val batchSize = clusterSize * clustersPerBatch
-                val batchBuffer = ByteArray(batchSize)
-                
-                var bytesWritten = 0L
-                var clusterIndex = 0
-                
-                while (clusterIndex < clusters.size) {
-                    val batchClusters = minOf(clustersPerBatch, clusters.size - clusterIndex)
-                    val batchBytes = batchClusters * clusterSize
-                    val remaining = fileSize - bytesWritten
-                    val toRead = minOf(remaining.toInt(), batchBytes)
-                    
-                    // Read data from input stream into batch buffer
-                    var totalRead = 0
-                    while (totalRead < toRead) {
-                        val read = inputStream.read(batchBuffer, totalRead, toRead - totalRead)
-                        if (read == -1) break
-                        totalRead += read
-                    }
-                    
-                    // Pad with zeros if needed
-                    if (totalRead < batchBytes) {
-                        java.util.Arrays.fill(batchBuffer, totalRead, batchBytes, 0.toByte())
-                    }
-                    
-                    // Check if clusters are contiguous for bulk write
-                    var contiguousCount = 1
-                    for (i in 1 until batchClusters) {
-                        if (clusters[clusterIndex + i] == clusters[clusterIndex + i - 1] + 1) {
-                            contiguousCount++
-                        } else {
-                            break
-                        }
-                    }
-                    
-                    if (contiguousCount == batchClusters && batchClusters > 1) {
-                        // All clusters are contiguous - write in one bulk operation
-                        val firstClusterSector = firstDataSector + ((clusters[clusterIndex] - 2) * bs.sectorsPerCluster)
-                        val dataToWrite = if (totalRead < batchBytes) {
-                            batchBuffer.copyOf(batchClusters * clusterSize)
-                        } else {
-                            batchBuffer.copyOf(batchBytes)
-                        }
-                        volumeReader.writeSectors(firstClusterSector.toLong(), dataToWrite).getOrThrow()
-                    } else {
-                        // Write clusters individually (non-contiguous)
-                        for (i in 0 until batchClusters) {
-                            val cluster = clusters[clusterIndex + i]
-                            val clusterSector = firstDataSector + ((cluster - 2) * bs.sectorsPerCluster)
-                            val clusterData = batchBuffer.copyOfRange(i * clusterSize, (i + 1) * clusterSize)
-                            volumeReader.writeSectors(clusterSector.toLong(), clusterData).getOrThrow()
-                        }
-                    }
-                    
-                    bytesWritten += totalRead
-                    clusterIndex += batchClusters
-                    onProgress?.invoke(bytesWritten)
-                }
-                
-                // Clear caches
-                fileCache.remove(path)
-                directoryCache.clear()
-                // Invalidate free space cache
-                invalidateFreeSpaceCache()
-                
-                Result.success(Unit)
+                Result.success(WriteAllocation(clusters, firstDataSector, clusterSize, bs.sectorsPerCluster))
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to write file streaming: $path", e)
+                Log.e(TAG, "Failed to write file streaming (metadata phase)", e)
                 Result.failure(e)
             }
+        }
+        
+        val allocation = allocationResult.getOrElse { return Result.failure(it) }
+        
+        // Phase 2: Stream data to allocated clusters (no lock needed —
+        // clusters are reserved in FAT so no other operation will use them)
+        return try {
+            val clustersPerBatch = 256  // 1MB per batch with 4KB clusters (was 64 = 256KB)
+            val batchSize = allocation.clusterSize * clustersPerBatch
+            val batchBuffer = ByteArray(batchSize)
+            
+            var bytesWritten = 0L
+            var clusterIndex = 0
+            
+            while (clusterIndex < allocation.clusters.size) {
+                val batchClusters = minOf(clustersPerBatch, allocation.clusters.size - clusterIndex)
+                val batchBytes = batchClusters * allocation.clusterSize
+                val remaining = fileSize - bytesWritten
+                val toRead = minOf(remaining.toInt(), batchBytes)
+                
+                var totalRead = 0
+                while (totalRead < toRead) {
+                    val read = inputStream.read(batchBuffer, totalRead, toRead - totalRead)
+                    if (read == -1) break
+                    totalRead += read
+                }
+                
+                if (totalRead < batchBytes) {
+                    java.util.Arrays.fill(batchBuffer, totalRead, batchBytes, 0.toByte())
+                }
+                
+                // Write contiguous runs directly from batchBuffer — encrypt in-place,
+                // no scratch buffer, no allocation. Each run operates on a non-overlapping
+                // slice of batchBuffer and is not needed after writing.
+                var batchOffset = 0
+                while (batchOffset < batchClusters) {
+                    // Find length of contiguous run starting at batchOffset
+                    var runLength = 1
+                    while (batchOffset + runLength < batchClusters &&
+                           allocation.clusters[clusterIndex + batchOffset + runLength] == 
+                           allocation.clusters[clusterIndex + batchOffset + runLength - 1] + 1) {
+                        runLength++
+                    }
+                    
+                    val runCluster = allocation.clusters[clusterIndex + batchOffset]
+                    val runSector = allocation.firstDataSector.toLong() + ((runCluster - 2).toLong() * allocation.sectorsPerCluster)
+                    val runBytes = runLength * allocation.clusterSize
+                    val srcOffset = batchOffset * allocation.clusterSize
+                    
+                    // Encrypt in-place and write directly from batchBuffer — zero allocation
+                    volumeReader.writeSectorsInPlace(runSector, batchBuffer, srcOffset, runBytes).getOrThrow()
+                    
+                    batchOffset += runLength
+                }
+                
+                bytesWritten += totalRead
+                clusterIndex += batchClusters
+                onProgress?.invoke(bytesWritten)
+            }
+            
+            fileCache.remove(path)
+            directoryCache.clear()
+            invalidateFreeSpaceCache()
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write file streaming (data phase)", e)
+            Result.failure(e)
         }
     }
     
@@ -1317,32 +1456,61 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             val totalClusters = ((bs.totalSectors - firstDataSector) / bs.sectorsPerCluster).toInt()
             
             var freeClusters = 0
-            var currentFatSector = -1
-            var fatSectorData: ByteArray? = null
+            val prefetchCount = 32
+            var clusterIndex = 2
             
-            // Start from cluster 2 (0,1 are reserved)
-            for (clusterIndex in 2..totalClusters) {
-                val entryOffset = clusterIndex * 4
-                val fatSectorOffset = entryOffset / SECTOR_SIZE
-                val offsetInSector = entryOffset % SECTOR_SIZE
+            while (clusterIndex <= totalClusters) {
+                val fatSectorOffset = (clusterIndex * 4) / SECTOR_SIZE
                 
-                // Use FAT cache first, then read if needed
-                if (fatSectorOffset != currentFatSector) {
-                    currentFatSector = fatSectorOffset
-                    fatSectorData = fatSectorCache[fatSectorOffset]
-                    if (fatSectorData == null) {
-                        fatSectorData = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrNull()
-                            ?: break
-                        // Cache the sector
-                        if (fatSectorCache.size < maxFatCacheSize) {
-                            fatSectorCache[fatSectorOffset] = fatSectorData
+                // Try per-sector cache (dirty sectors from writes), then block cache
+                var fatSectorData = fatSectorCache[fatSectorOffset]
+                if (fatSectorData == null) {
+                    // Try block cache
+                    val blockStart = (fatSectorOffset / fatBlockSectors) * fatBlockSectors
+                    val block = fatBlockCache[blockStart]
+                    if (block != null) {
+                        val sectorInBlock = fatSectorOffset - blockStart
+                        if ((sectorInBlock + 1) * SECTOR_SIZE <= block.size) {
+                            fatSectorData = block.copyOfRange(sectorInBlock * SECTOR_SIZE, (sectorInBlock + 1) * SECTOR_SIZE)
                         }
                     }
                 }
+                if (fatSectorData == null) {
+                    val batchData = volumeReader.readSectors(
+                        (fatStartSector + fatSectorOffset).toLong(),
+                        prefetchCount
+                    ).getOrNull()
+                    
+                    if (batchData != null) {
+                        // Store as block cache entry
+                        val blockStart = (fatSectorOffset / fatBlockSectors) * fatBlockSectors
+                        if (fatSectorOffset == blockStart) {
+                            fatBlockCache.putIfAbsent(blockStart, batchData)
+                        }
+                        // Also extract the sector we need
+                        fatSectorData = batchData.copyOfRange(0, SECTOR_SIZE)
+                    }
+                    
+                    if (fatSectorData == null) {
+                        fatSectorData = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrNull()
+                            ?: break
+                    }
+                }
                 
-                val entry = ByteBuffer.wrap(fatSectorData!!, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).int and 0x0FFFFFFF
-                if (entry == 0) {
-                    freeClusters++
+                // Process all entries in this sector in a tight loop
+                val data = fatSectorData
+                var offsetInSector = (clusterIndex * 4) % SECTOR_SIZE
+                while (offsetInSector <= SECTOR_SIZE - 4 && clusterIndex <= totalClusters) {
+                    val b0 = data[offsetInSector].toInt() and 0xFF
+                    val b1 = data[offsetInSector + 1].toInt() and 0xFF
+                    val b2 = data[offsetInSector + 2].toInt() and 0xFF
+                    val b3 = data[offsetInSector + 3].toInt() and 0xFF
+                    val entry = (b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)) and 0x0FFFFFFF
+                    if (entry == 0) {
+                        freeClusters++
+                    }
+                    clusterIndex++
+                    offsetInSector += 4
                 }
             }
             
@@ -1429,7 +1597,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             val totalClusters = ((bs.totalSectors - firstDataSector) / bs.sectorsPerCluster).toInt()
             
             // Validate we have enough clusters
-            if (count > totalClusters - 1) { // -1 for root directory at cluster 2
+            if (count > totalClusters - 1) {
                 Log.e(TAG, "Not enough clusters: need $count, have ${totalClusters - 1}")
                 return emptyList()
             }
@@ -1439,11 +1607,13 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             var currentFatSector = -1
             var fatSectorData: ByteArray? = null
             var wrapped = false
+            val prefetchCount = 32 // Read 32 sectors at a time (covers 4096 clusters)
+            val clustersPerSector = SECTOR_SIZE / 4 // 128 clusters per 512-byte sector
             
             while (clusters.size < count) {
                 // Wrap around if we reached the end
                 if (clusterIndex > totalClusters) {
-                    if (wrapped) break // Already wrapped once, no more free clusters
+                    if (wrapped) break
                     clusterIndex = 2
                     wrapped = true
                 }
@@ -1452,37 +1622,83 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 if (wrapped && clusterIndex >= lastAllocatedCluster) break
                 
                 // Calculate which FAT sector contains this cluster entry
-                val entryOffset = clusterIndex * 4
-                val fatSectorOffset = entryOffset / SECTOR_SIZE
-                val offsetInSector = entryOffset % SECTOR_SIZE
+                val fatSectorOffset = (clusterIndex * 4) / SECTOR_SIZE
                 
-                // Check FAT cache first, then read if needed
+                // Load FAT sector if needed
                 if (fatSectorOffset != currentFatSector) {
                     currentFatSector = fatSectorOffset
+                    // Check per-sector cache first (dirty writes), then block cache
                     fatSectorData = fatSectorCache[fatSectorOffset]
                     if (fatSectorData == null) {
-                        fatSectorData = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrNull()
-                        if (fatSectorData == null) {
-                            Log.e(TAG, "Failed to read FAT sector at offset $fatSectorOffset")
-                            break
+                        val blockStart = (fatSectorOffset / fatBlockSectors) * fatBlockSectors
+                        val block = fatBlockCache[blockStart]
+                        if (block != null) {
+                            val sectorInBlock = fatSectorOffset - blockStart
+                            if ((sectorInBlock + 1) * SECTOR_SIZE <= block.size) {
+                                fatSectorData = block.copyOfRange(sectorInBlock * SECTOR_SIZE, (sectorInBlock + 1) * SECTOR_SIZE)
+                                fatSectorCache[fatSectorOffset] = fatSectorData
+                            }
                         }
-                        // Cache the sector
+                    }
+                    if (fatSectorData == null) {
+                        val batchData = volumeReader.readSectors(
+                            (fatStartSector + fatSectorOffset).toLong(),
+                            prefetchCount
+                        ).getOrNull()
+                        
+                        if (batchData != null) {
+                            // Store in block cache
+                            val blockStart = (fatSectorOffset / fatBlockSectors) * fatBlockSectors
+                            if (fatSectorOffset == blockStart) {
+                                fatBlockCache.putIfAbsent(blockStart, batchData)
+                            }
+                            // Extract the sector we need into per-sector cache for write-path compat
+                            val sectorInBatch = 0
+                            fatSectorData = batchData.copyOfRange(0, SECTOR_SIZE)
+                            fatSectorCache.putIfAbsent(fatSectorOffset, fatSectorData)
+                        }
+                        
+                        if (fatSectorData == null) {
+                            fatSectorData = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrNull()
+                            if (fatSectorData == null) {
+                                Log.e(TAG, "Failed to read FAT sector at offset $fatSectorOffset")
+                                break
+                            }
+                            fatSectorCache[fatSectorOffset] = fatSectorData
+                        }
+                        
                         if (fatSectorCache.size >= maxFatCacheSize) {
                             fatSectorCache.keys.take(maxFatCacheSize / 4).forEach { fatSectorCache.remove(it) }
                         }
-                        fatSectorCache[fatSectorOffset] = fatSectorData
                     }
                 }
                 
-                // Check if cluster is free (entry is 0x00000000)
-                val entry = ByteBuffer.wrap(fatSectorData!!, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).int and 0x0FFFFFFF
-                if (entry == 0) {
-                    clusters.add(clusterIndex)
-                    // Update hint for next allocation
-                    lastAllocatedCluster = clusterIndex + 1
-                }
+                // Process all remaining entries in this sector in one tight loop
+                // (no ByteBuffer allocation per entry — direct byte reads)
+                val data = fatSectorData!!
+                var offsetInSector = (clusterIndex * 4) % SECTOR_SIZE
                 
-                clusterIndex++
+                while (offsetInSector <= SECTOR_SIZE - 4 && clusters.size < count) {
+                    // Check wrap/bounds on clusterIndex
+                    if (clusterIndex > totalClusters) break
+                    if (wrapped && clusterIndex >= lastAllocatedCluster) break
+                    
+                    // Read 4-byte LE FAT entry directly from byte array
+                    val b0 = data[offsetInSector].toInt() and 0xFF
+                    val b1 = data[offsetInSector + 1].toInt() and 0xFF
+                    val b2 = data[offsetInSector + 2].toInt() and 0xFF
+                    val b3 = data[offsetInSector + 3].toInt() and 0xFF
+                    val entry = (b0 or (b1 shl 8) or (b2 shl 16) or (b3 shl 24)) and 0x0FFFFFFF
+                    
+                    if (entry == 0) {
+                        clusters.add(clusterIndex)
+                        lastAllocatedCluster = clusterIndex + 1
+                    }
+                    
+                    clusterIndex++
+                    offsetInSector += 4
+                }
+                // Loop back to top to load next sector
             }
             
             if (clusters.size < count) {
@@ -1495,10 +1711,91 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 cachedFreeClusters -= clusters.size
             }
             
+            // Update FSInfo sector with new hint so next mount starts from the right place
+            updateFSInfo()
+            
             return clusters
         } catch (e: Exception) {
             Log.e(TAG, "Failed to allocate clusters", e)
             return emptyList()
+        }
+    }
+    
+    /**
+     * Update the FSInfo sector with current free cluster count and next free cluster hint.
+     * This persists the allocation hint so future mounts don't need to scan the entire FAT.
+     */
+    private fun updateFSInfo() {
+        try {
+            val bs = bootSector ?: return
+            // Boot sector stores FSInfo sector number at offset 48
+            val bootSectorData = volumeReader.readSector(0).getOrNull() ?: return
+            val fsInfoSectorNum = ByteBuffer.wrap(bootSectorData).order(ByteOrder.LITTLE_ENDIAN).getShort(48).toInt() and 0xFFFF
+            if (fsInfoSectorNum < 1 || fsInfoSectorNum >= bs.reservedSectors) return
+            
+            val fsInfoData = volumeReader.readSector(fsInfoSectorNum.toLong()).getOrNull() ?: return
+            val buf = ByteBuffer.wrap(fsInfoData).order(ByteOrder.LITTLE_ENDIAN)
+            
+            // Verify signatures
+            if (buf.getInt(0) != 0x41615252 || buf.getInt(484) != 0x61417272) return
+            
+            // Update nxtFree (offset 492) and free count (offset 488)
+            buf.putInt(492, lastAllocatedCluster)
+            if (cachedFreeClusters >= 0) {
+                buf.putInt(488, cachedFreeClusters)
+            }
+            
+            volumeReader.writeSector(fsInfoSectorNum.toLong(), fsInfoData).getOrThrow()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to update FSInfo sector", e)
+        }
+    }
+    
+    /**
+     * Batch-write modified FAT sectors to both FAT copies.
+     * Groups consecutive sector offsets into single writeSectors calls to
+     * reduce individual encrypt+lock+I/O cycles (e.g., 200 individual writes → ~4 batch writes).
+     */
+    private fun batchWriteFATSectors(fatUpdates: Map<Int, ByteArray>) {
+        if (fatUpdates.isEmpty()) return
+        val bs = bootSector ?: return
+        val fatStartSector = bs.reservedSectors
+        val secondFATStart = fatStartSector + bs.sectorsPerFAT
+        val sortedKeys = fatUpdates.keys.sorted()
+        var idx = 0
+        
+        while (idx < sortedKeys.size) {
+            // Find consecutive run of FAT sectors
+            var runLen = 1
+            while (idx + runLen < sortedKeys.size &&
+                   sortedKeys[idx + runLen] == sortedKeys[idx] + runLen) {
+                runLen++
+            }
+            
+            val firstKey = sortedKeys[idx]
+            
+            if (runLen == 1) {
+                // Single sector — use existing writeSector
+                val sectorData = fatUpdates[firstKey]!!
+                volumeReader.writeSector((fatStartSector + firstKey).toLong(), sectorData).getOrThrow()
+                volumeReader.writeSector((secondFATStart + firstKey).toLong(), sectorData).getOrThrow()
+                fatSectorCache[firstKey] = sectorData.copyOf()
+            } else {
+                // Combine consecutive sectors into one batch write
+                val combinedData = ByteArray(runLen * SECTOR_SIZE)
+                for (r in 0 until runLen) {
+                    System.arraycopy(fatUpdates[sortedKeys[idx + r]]!!, 0, combinedData, r * SECTOR_SIZE, SECTOR_SIZE)
+                }
+                // writeSectors allocates its own encrypted copy, so combinedData is preserved for FAT2
+                volumeReader.writeSectors((fatStartSector + firstKey).toLong(), combinedData).getOrThrow()
+                volumeReader.writeSectors((secondFATStart + firstKey).toLong(), combinedData).getOrThrow()
+                
+                for (r in 0 until runLen) {
+                    fatSectorCache[sortedKeys[idx + r]] = fatUpdates[sortedKeys[idx + r]]!!.copyOf()
+                }
+            }
+            
+            idx += runLen
         }
     }
     
@@ -1523,27 +1820,19 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 val fatSectorOffset = entryOffset / SECTOR_SIZE
                 val offsetInSector = entryOffset % SECTOR_SIZE
                 
-                // Get or read FAT sector
+                // Get or read FAT sector — check local map, then FAT cache, then disk
                 val fatSector = fatUpdates.getOrPut(fatSectorOffset) {
-                    volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
+                    fatSectorCache[fatSectorOffset]?.copyOf()
+                        ?: volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
                 }
                 
                 // Write next cluster value
                 ByteBuffer.wrap(fatSector, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(nextCluster)
             }
             
-            // Write all modified FAT sectors to both FAT copies
-            for ((sectorOffset, data) in fatUpdates) {
-                // Write to first FAT
-                volumeReader.writeSector((fatStartSector + sectorOffset).toLong(), data).getOrThrow()
-                
-                // Write to second FAT
-                val secondFATStart = fatStartSector + bs.sectorsPerFAT
-                volumeReader.writeSector((secondFATStart + sectorOffset).toLong(), data).getOrThrow()
-                
-                // Update FAT sector cache with written data
-                fatSectorCache[sectorOffset] = data.copyOf()
-            }
+            // Batch-write consecutive FAT sectors (reduces N×2 individual
+            // encrypt+lock+write cycles to ~2-4 batch operations total)
+            batchWriteFATSectors(fatUpdates)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write cluster chain", e)
         }
@@ -1563,9 +1852,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 val fatSectorOffset = entryOffset / SECTOR_SIZE
                 val offsetInSector = entryOffset % SECTOR_SIZE
                 
-                // Get or read FAT sector
+                // Get or read FAT sector — check local map, then FAT cache, then disk
                 val fatSector = fatUpdates.getOrPut(fatSectorOffset) {
-                    volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
+                    fatSectorCache[fatSectorOffset]?.copyOf()
+                        ?: volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
                 }
                 
                 // Read next cluster before we overwrite
@@ -1577,40 +1867,21 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 cluster = nextCluster
             }
             
-            // Write all modified FAT sectors to both FAT copies
-            for ((sectorOffset, data) in fatUpdates) {
-                // Write to first FAT
-                volumeReader.writeSector((fatStartSector + sectorOffset).toLong(), data).getOrThrow()
-                
-                // Write to second FAT
-                val secondFATStart = fatStartSector + bs.sectorsPerFAT
-                volumeReader.writeSector((secondFATStart + sectorOffset).toLong(), data).getOrThrow()
-                
-                // Update FAT sector cache
-                fatSectorCache[sectorOffset] = data.copyOf()
-            }
+            // Batch-write consecutive FAT sectors (same optimization as writeClusterChain)
+            batchWriteFATSectors(fatUpdates)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to free clusters", e)
         }
     }
     
     /**
-     * Get the next cluster in the chain from the FAT
+     * Get the next cluster in the chain from the FAT.
+     * Uses readFATEntry which has 32-sector prefetch cache for performance.
      */
     private fun getNextCluster(cluster: Int): Int {
-        val bs = bootSector ?: return 0x0FFFFFFF
-        val fatStartSector = bs.reservedSectors
-        
-        try {
-            val entryOffset = cluster * 4
-            val fatSectorOffset = entryOffset / SECTOR_SIZE
-            val offsetInSector = entryOffset % SECTOR_SIZE
-            
-            val fatSector = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
-            return ByteBuffer.wrap(fatSector, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).int
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to get next cluster for $cluster", e)
-            return 0x0FFFFFFF // Return EOF on error
+        return readFATEntry(cluster).getOrElse {
+            Log.e(TAG, "Failed to get next cluster for $cluster", it)
+            0x0FFFFFFF // Return EOF on error
         }
     }
     
@@ -1676,16 +1947,16 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 // Check if file already exists
                 val fullPath = if (parentPath == "/") "/$name" else "$parentPath/$name"
                 if (exists(fullPath)) {
-                    Log.d(TAG, "createFile: File already exists: $fullPath")
+                    if (DEBUG_LOGGING) Log.d(TAG, "createFile: File already exists: $fullPath")
                     return@withLock Result.failure(Exception("File already exists"))
                 }
                 
-                Log.d(TAG, "createFile: Creating $name in $parentPath")
+                if (DEBUG_LOGGING) Log.d(TAG, "createFile: Creating $name in $parentPath")
                 
                 // Create directory entry
                 val newEntry = createDirectoryEntry(parentPath, name, isDirectory = false)
                 
-                Log.d(TAG, "createFile: Successfully created entry for $fullPath")
+                if (DEBUG_LOGGING) Log.d(TAG, "createFile: Successfully created entry for $fullPath")
                 
                 // Clear parent directory cache so it gets re-read
                 directoryCache.remove(normalizePath(parentPath))
@@ -1697,7 +1968,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 Result.success(newEntry)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to create file: $name in $parentPath", e)
+                Log.e(TAG, "Failed to create file", e)
                 Result.failure(e)
             }
         }
@@ -1706,7 +1977,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
     override fun createDirectory(parentPath: String, name: String): Result<FileEntry> {
         return writeLock.withLock {
             try {
-                Log.d(TAG, "createDirectory: name=$name, parentPath=$parentPath")
+                if (DEBUG_LOGGING) Log.d(TAG, "createDirectory: name=$name, parentPath=$parentPath")
                 val bs = bootSector ?: return@withLock Result.failure(Exception("File system not initialized"))
                 
                 // Validate name
@@ -1722,7 +1993,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 
                 // Create directory entry
                 val newEntry = createDirectoryEntry(parentPath, name, isDirectory = true)
-                Log.d(TAG, "createDirectory: created entry at ${newEntry.path}, firstCluster=${newEntry.firstCluster}")
+                if (DEBUG_LOGGING) Log.d(TAG, "createDirectory: created entry at ${newEntry.path}, firstCluster=${newEntry.firstCluster}")
                 
                 // Clear parent directory cache so it gets re-read
                 directoryCache.remove(normalizePath(parentPath))
@@ -1736,7 +2007,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 Result.success(newEntry)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to create directory: $name in $parentPath", e)
+                Log.e(TAG, "Failed to create directory", e)
                 Result.failure(e)
             }
         }
@@ -1745,7 +2016,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
     override fun delete(path: String): Result<Unit> {
         return writeLock.withLock {
             try {
-                Log.d(TAG, "delete: Starting deletion of $path")
+                if (DEBUG_LOGGING) Log.d(TAG, "delete: Starting deletion of $path")
                 
                 if (path == "/") {
                     return@withLock Result.failure(Exception("Cannot delete root directory"))
@@ -1756,12 +2027,12 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 fileCache.remove(path)
                 
                 val fileInfo = getFileInfo(path).getOrThrow()
-                Log.d(TAG, "delete: Found entry, isDirectory=${fileInfo.isDirectory}")
+                if (DEBUG_LOGGING) Log.d(TAG, "delete: Found entry, isDirectory=${fileInfo.isDirectory}")
                 
                 // For directories, recursively delete contents first
                 if (fileInfo.isDirectory) {
                     val entries = listDirectory(path).getOrThrow()
-                    Log.d(TAG, "delete: Directory has ${entries.size} entries to delete")
+                    if (DEBUG_LOGGING) Log.d(TAG, "delete: Directory has ${entries.size} entries to delete")
                     for (entry in entries) {
                         // Recursively delete each child
                         val childResult = deleteRecursive(entry.path)
@@ -1774,7 +2045,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 }
                 
                 // Mark directory entry as deleted
-                Log.d(TAG, "delete: Now deleting the entry itself at $path")
+                if (DEBUG_LOGGING) Log.d(TAG, "delete: Now deleting the entry itself at $path")
                 deleteDirectoryEntry(path)
                 
                 // Clear caches - handle both "/" and "" as root path representations
@@ -1790,11 +2061,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 // Invalidate free space cache
                 invalidateFreeSpaceCache()
                 
-                Log.d(TAG, "delete: Successfully deleted $path")
+                if (DEBUG_LOGGING) Log.d(TAG, "delete: Successfully deleted")
                 Result.success(Unit)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to delete: $path", e)
+                Log.e(TAG, "Failed to delete", e)
                 Result.failure(e)
             }
         }
@@ -1825,7 +2096,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             
             // Mark directory entry as deleted
-            Log.d(TAG, "deleteRecursive: Deleting entry at $path")
+            if (DEBUG_LOGGING) Log.d(TAG, "deleteRecursive: Deleting entry")
             deleteDirectoryEntry(path)
             
             // Clear caches - handle both "/" and "" as root path representations
@@ -1839,11 +2110,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 directoryCache.remove("/")
             }
             
-            Log.d(TAG, "deleteRecursive: Successfully deleted $path")
+            if (DEBUG_LOGGING) Log.d(TAG, "deleteRecursive: Successfully deleted")
             return Result.success(Unit)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to delete recursively: $path", e)
+            Log.e(TAG, "Failed to delete recursively", e)
             return Result.failure(e)
         }
     }
@@ -1893,8 +2164,8 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             lastCluster = currentCluster
             
             // Read this cluster in one bulk operation
-            val firstSectorOfCluster = ((currentCluster - 2) * bs.sectorsPerCluster) + firstDataSector
-            clusterData = volumeReader.readSectors(firstSectorOfCluster.toLong(), bs.sectorsPerCluster).getOrThrow()
+            val firstSectorOfCluster = ((currentCluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
+            clusterData = volumeReader.readSectors(firstSectorOfCluster, bs.sectorsPerCluster).getOrThrow()
             
             // Look for free entries in this cluster
             var consecutiveFree = 0
@@ -1946,8 +2217,8 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             // Initialize the new cluster with zeros (all entries free)
             clusterData = ByteArray(clusterSize)
-            val newClusterFirstSector = ((newCluster - 2) * bs.sectorsPerCluster) + firstDataSector
-            volumeReader.writeSectors(newClusterFirstSector.toLong(), clusterData).getOrThrow()
+            val newClusterFirstSector = ((newCluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
+            volumeReader.writeSectors(newClusterFirstSector, clusterData).getOrThrow()
             
             targetCluster = newCluster
             freeOffset = 0 // First entry in the new cluster
@@ -1956,8 +2227,8 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         // Now we have freeOffset and targetCluster set
         // Re-read the target cluster if needed
         if (targetCluster != lastCluster || freeOffset == 0) {
-            val firstSectorOfCluster = ((targetCluster - 2) * bs.sectorsPerCluster) + firstDataSector
-            clusterData = volumeReader.readSectors(firstSectorOfCluster.toLong(), bs.sectorsPerCluster).getOrThrow()
+            val firstSectorOfCluster = ((targetCluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
+            clusterData = volumeReader.readSectors(firstSectorOfCluster, bs.sectorsPerCluster).getOrThrow()
         }
         
         // Create 8.3 short name
@@ -2099,8 +2370,17 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         }
         
         // Write back modified cluster to the target cluster
-        val targetSectorOfCluster = ((targetCluster - 2) * bs.sectorsPerCluster) + firstDataSector
-        volumeReader.writeSectors(targetSectorOfCluster.toLong(), clusterData).getOrThrow()
+        val targetSectorOfCluster = ((targetCluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
+        if (DEBUG_LOGGING) Log.d(TAG, "createDirectoryEntry: Writing to cluster=$targetCluster sector=$targetSectorOfCluster freeOffset=$freeOffset totalEntries=$totalEntriesNeeded needsLfn=$needsLfn")
+        volumeReader.writeSectors(targetSectorOfCluster, clusterData).getOrThrow()
+        
+        // Verify write by reading back and checking the 8.3 entry
+        val verifyData = volumeReader.readSectors(targetSectorOfCluster, bs.sectorsPerCluster).getOrThrow()
+        val entryCheckOffset = if (needsLfn) freeOffset + (lfnEntriesNeeded * 32) else freeOffset
+        val verifyByte0 = verifyData[entryCheckOffset].toInt() and 0xFF
+        val verifyAttr = verifyData[entryCheckOffset + 11].toInt() and 0xFF
+        val verifyMatchesWrite = verifyData.contentEquals(clusterData)
+        Log.d(TAG, "createDirectoryEntry: VERIFY readback at offset=$entryCheckOffset byte0=0x${verifyByte0.toString(16)} attr=0x${verifyAttr.toString(16)} fullMatch=$verifyMatchesWrite")
         
         // Return the original long name if LFN was used, otherwise the short name
         val actualName = if (needsLfn) name else parseShortFileName(entryData, 0)
@@ -2126,9 +2406,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         Log.d(TAG, "initializeDirectoryCluster: cluster=$cluster, parentCluster=$parentCluster")
         
         val firstDataSector = bs.reservedSectors + (bs.numberOfFATs * bs.sectorsPerFAT)
-        val firstSectorOfCluster = ((cluster - 2) * bs.sectorsPerCluster) + firstDataSector
-        
-        Log.d(TAG, "initializeDirectoryCluster: writing to sector $firstSectorOfCluster")
+        val firstSectorOfCluster = ((cluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
         
         // Create cluster data, initially all zeros (important - marks end of directory)
         val clusterData = ByteArray(bs.sectorsPerCluster * SECTOR_SIZE)
@@ -2162,14 +2440,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         
         Log.d(TAG, "initializeDirectoryCluster: dotEntry[0]=0x${dotEntry[0].toInt().and(0xFF).toString(16)}, dotDotEntry[0]=0x${dotDotEntry[0].toInt().and(0xFF).toString(16)}")
         
-        // Write cluster data
-        for (i in 0 until bs.sectorsPerCluster) {
-            val sectorData = clusterData.copyOfRange(i * SECTOR_SIZE, (i + 1) * SECTOR_SIZE)
-            volumeReader.writeSector(firstSectorOfCluster.toLong() + i, sectorData).getOrThrow()
-        }
+        // Write cluster data in one bulk write
+        volumeReader.writeSectors(firstSectorOfCluster, clusterData).getOrThrow()
         
         // Verify write by reading back
-        val verifyData = volumeReader.readSector(firstSectorOfCluster.toLong()).getOrThrow()
+        val verifyData = volumeReader.readSector(firstSectorOfCluster).getOrThrow()
         val verifyByte0 = verifyData[0].toInt() and 0xFF
         val verifyByte32 = verifyData[32].toInt() and 0xFF
         Log.d(TAG, "initializeDirectoryCluster: VERIFY - byte[0]=0x${verifyByte0.toString(16)}, byte[32]=0x${verifyByte32.toString(16)}")
@@ -2203,14 +2478,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         
         // Follow cluster chain
         while (currentCluster >= 2 && currentCluster < 0x0FFFFFF8 && !found) {
-            val firstSectorOfCluster = ((currentCluster - 2) * bs.sectorsPerCluster) + firstDataSector
+            val firstSectorOfCluster = ((currentCluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
             
-            // Read cluster data
-            val clusterData = ByteArray(clusterSize)
-            for (i in 0 until bs.sectorsPerCluster) {
-                val sectorData = volumeReader.readSector(firstSectorOfCluster.toLong() + i).getOrThrow()
-                System.arraycopy(sectorData, 0, clusterData, i * SECTOR_SIZE, SECTOR_SIZE)
-            }
+            // Read cluster data in one bulk read
+            val clusterData = volumeReader.readSectors(firstSectorOfCluster, bs.sectorsPerCluster).getOrThrow()
             
             // Parse directory entries, tracking LFN entries
             var offset = 0
@@ -2276,11 +2547,8 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                     
                     found = true
                     
-                    // Write back modified cluster
-                    for (i in 0 until bs.sectorsPerCluster) {
-                        val sectorData = clusterData.copyOfRange(i * SECTOR_SIZE, (i + 1) * SECTOR_SIZE)
-                        volumeReader.writeSector(firstSectorOfCluster.toLong() + i, sectorData).getOrThrow()
-                    }
+                    // Write back modified cluster in one bulk write
+                    volumeReader.writeSectors(firstSectorOfCluster, clusterData).getOrThrow()
                     break
                 }
                 

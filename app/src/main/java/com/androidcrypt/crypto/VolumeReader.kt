@@ -39,8 +39,12 @@ class VolumeReader(
     private var dataAreaOffset: Long = 0
     private var dataAreaSize: Long = 0
     
-    // Lock for I/O operations only - decryption happens outside this lock
-    private val ioLock = java.util.concurrent.locks.ReentrantLock()
+    // ReadWriteLock for I/O operations — reads use readLock (pread is thread-safe
+    // for concurrent reads at different offsets), writes use writeLock (exclusive).
+    // This allows multiple files / thumbnails to read concurrently.
+    private val ioRwLock = java.util.concurrent.locks.ReentrantReadWriteLock()
+    private val ioReadLock = ioRwLock.readLock()
+    private val ioWriteLock = ioRwLock.writeLock()
     
     // Thread-local timing for accurate per-operation measurements
     private val threadLocalTiming = ThreadLocal<LongArray>()
@@ -253,61 +257,11 @@ class VolumeReader(
     }
     
     /**
-     * Read a sector from the encrypted volume
-     * Uses ioLock only for file I/O, decryption happens outside the lock
+     * Read a sector from the encrypted volume.
+     * Delegates to readSectors for consistent I/O and decryption path.
      */
     fun readSector(sectorNumber: Long): Result<ByteArray> {
-        return try {
-            if (masterKey == null) {
-                Log.e(TAG, "Cannot read sector: masterKey is null, volume not properly mounted")
-                return Result.failure(Exception("Volume not mounted"))
-            }
-            
-            if (volumeFile == null && parcelFd == null) {
-                Log.e(TAG, "Cannot read sector: no file handle available")
-                return Result.failure(Exception("Volume file not open"))
-            }
-            
-            val sectorOffset = dataAreaOffset + (sectorNumber * SECTOR_SIZE)
-            if (sectorOffset + SECTOR_SIZE > volumeSize) {
-                return Result.failure(Exception("Sector out of bounds"))
-            }
-            
-            // Read encrypted sector - lock only during I/O
-            val encryptedSector = ByteArray(SECTOR_SIZE)
-            
-            ioLock.lock()
-            try {
-                if (volumeFile != null) {
-                    // File path mode
-                    volumeFile?.seek(sectorOffset)
-                    volumeFile?.readFully(encryptedSector)
-                } else if (parcelFd != null) {
-                    // URI mode using ParcelFileDescriptor
-                    // Use Os.pread for atomic positioned read (no seek needed)
-                    val fd = parcelFd!!.fileDescriptor
-                    var read = 0
-                    while (read < SECTOR_SIZE) {
-                        val r = Os.pread(fd, encryptedSector, read, SECTOR_SIZE - read, sectorOffset + read)
-                        if (r <= 0) break
-                        read += r
-                    }
-                }
-            } finally {
-                ioLock.unlock()
-            }
-            
-            // Decrypt using XTS mode OUTSIDE the lock (thread-safe version)
-            // XTS sector number is absolute from start of volume, not relative to data area
-            val xtsSectorNumber = (dataAreaOffset / SECTOR_SIZE) + sectorNumber
-            val decryptedSector = xtsMode!!.decryptSectorThreadSafe(encryptedSector, xtsSectorNumber)
-            
-            Result.success(decryptedSector)
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error reading sector $sectorNumber", e)
-            Result.failure(e)
-        }
+        return readSectors(sectorNumber, 1)
     }
     
     /**
@@ -331,39 +285,47 @@ class VolumeReader(
                 return Result.failure(Exception("Read would exceed volume bounds"))
             }
             
-            // Read all encrypted data in one I/O operation - lock only for I/O
-            val encryptedData = ByteArray(totalBytes)
+            // Single buffer: read encrypted data in, decrypt in-place.
+            // decryptBatchThreadSafe copies each sector to a scratch buffer before
+            // writing output, so using the same array for input and output is safe.
+            val data = ByteArray(totalBytes)
             
             val ioStart = System.currentTimeMillis()
-            ioLock.lock()
+            ioReadLock.lock()
             try {
                 if (volumeFile != null) {
-                    volumeFile?.seek(startOffset)
-                    volumeFile?.readFully(encryptedData)
+                    // Positional read via FileChannel — thread-safe, no seek needed
+                    val channel = volumeFile!!.channel
+                    val buf = ByteBuffer.wrap(data)
+                    var read = 0
+                    while (read < totalBytes) {
+                        val r = channel.read(buf, startOffset + read)
+                        if (r <= 0) break
+                        read += r
+                    }
                 } else if (parcelFd != null) {
                     val fd = parcelFd!!.fileDescriptor
                     var read = 0
                     while (read < totalBytes) {
-                        val r = Os.pread(fd, encryptedData, read, totalBytes - read, startOffset + read)
+                        val r = Os.pread(fd, data, read, totalBytes - read, startOffset + read)
                         if (r <= 0) break
                         read += r
                     }
                 }
             } finally {
-                ioLock.unlock()
+                ioReadLock.unlock()
             }
             val t = getTiming()
             t[0] += System.currentTimeMillis() - ioStart
             t[2]++
             
-            // Decrypt all sectors OUTSIDE the lock - use parallel batch decryption
-            val decryptedData = ByteArray(totalBytes)
+            // Decrypt in-place OUTSIDE the lock - use parallel batch decryption
             val baseTweakSector = (dataAreaOffset / SECTOR_SIZE) + startSector
             
             val decryptStart = System.currentTimeMillis()
-            if (count >= 16) {
+            if (count >= 4) {
                 // Parallel batch decryption using thread pool (no thread creation overhead)
-                val numThreads = minOf(Runtime.getRuntime().availableProcessors(), 8)
+                val numThreads = minOf(Runtime.getRuntime().availableProcessors(), 8, count)
                 val sectorsPerThread = count / numThreads
                 val latch = java.util.concurrent.CountDownLatch(numThreads)
                 
@@ -374,10 +336,10 @@ class VolumeReader(
                     encryptionExecutor.execute {
                         try {
                             xtsMode!!.decryptBatchThreadSafe(
-                                encryptedData,
+                                data,
                                 baseTweakSector + startIdx,
                                 SECTOR_SIZE,
-                                decryptedData,
+                                data,
                                 startIdx * SECTOR_SIZE,
                                 sectorCountForThread
                             )
@@ -390,19 +352,19 @@ class VolumeReader(
                 // Wait for all tasks to complete
                 latch.await()
             } else {
-                // Sequential decryption for small reads - use batch for efficiency
+                // Sequential decryption for very small reads (1-3 sectors)
                 xtsMode!!.decryptBatchThreadSafe(
-                    encryptedData,
+                    data,
                     baseTweakSector,
                     SECTOR_SIZE,
-                    decryptedData,
+                    data,
                     0,
                     count
                 )
             }
             t[1] += System.currentTimeMillis() - decryptStart
             
-            Result.success(decryptedData)
+            Result.success(data)
         } catch (e: Exception) {
             Log.e(TAG, "Error reading sectors starting at $startSector", e)
             Result.failure(e)
@@ -437,15 +399,20 @@ class VolumeReader(
             val xtsSectorNumber = (dataAreaOffset / SECTOR_SIZE) + sectorNumber
             val encryptedSector = xtsMode!!.encryptSectorThreadSafe(data, xtsSectorNumber)
             
-            // Write encrypted sector - lock only for I/O
-            ioLock.lock()
+            // Write encrypted sector - writeLock for exclusive I/O
+            ioWriteLock.lock()
             try {
                 if (volumeFile != null) {
-                    // File path mode
-                    volumeFile?.seek(sectorOffset)
-                    volumeFile?.write(encryptedSector)
+                    // Positional write via FileChannel — thread-safe
+                    val channel = volumeFile!!.channel
+                    val buf = ByteBuffer.wrap(encryptedSector)
+                    var written = 0
+                    while (written < SECTOR_SIZE) {
+                        val w = channel.write(buf, sectorOffset + written)
+                        if (w <= 0) break
+                        written += w
+                    }
                 } else if (parcelFd != null) {
-                    // URI mode using ParcelFileDescriptor
                     // Use Os.pwrite for atomic positioned write (no seek needed)
                     val fd = parcelFd!!.fileDescriptor
                     var written = 0
@@ -456,7 +423,7 @@ class VolumeReader(
                     }
                 }
             } finally {
-                ioLock.unlock()
+                ioWriteLock.unlock()
             }
             
             Result.success(Unit)
@@ -496,27 +463,30 @@ class VolumeReader(
             val encryptedData = ByteArray(data.size)
             val baseTweakSector = (dataAreaOffset / SECTOR_SIZE) + startSector
             
-            // Use parallel encryption for writes (more than 8 sectors = 4KB)
-            if (sectorCount > 8) {
-                val numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
+            // Use parallel batch encryption for writes (4+ sectors)
+            // encryptBatchThreadSafe processes sectors in bulk — one cipher call per sector,
+            // no per-sector ByteArray allocation, uses ThreadLocal cached ciphers
+            if (sectorCount >= 4) {
+                val numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 8).coerceAtMost(sectorCount)
                 val sectorsPerThread = (sectorCount + numThreads - 1) / numThreads
                 
                 val futures = mutableListOf<Future<*>>()
                 
                 for (threadIdx in 0 until numThreads) {
                     val startIdx = threadIdx * sectorsPerThread
-                    val endIdx = minOf(startIdx + sectorsPerThread, sectorCount)
+                    val sectorCountForThread = if (threadIdx == numThreads - 1) sectorCount - startIdx else sectorsPerThread
                     
                     if (startIdx >= sectorCount) break
                     
                     val future = encryptionExecutor.submit {
-                        for (i in startIdx until endIdx) {
-                            val sectorData = ByteArray(SECTOR_SIZE)
-                            System.arraycopy(data, i * SECTOR_SIZE, sectorData, 0, SECTOR_SIZE)
-                            // Use thread-safe method
-                            val encryptedSector = xtsMode!!.encryptSectorThreadSafe(sectorData, baseTweakSector + i)
-                            System.arraycopy(encryptedSector, 0, encryptedData, i * SECTOR_SIZE, SECTOR_SIZE)
-                        }
+                        xtsMode!!.encryptBatchThreadSafe(
+                            data,
+                            baseTweakSector + startIdx,
+                            SECTOR_SIZE,
+                            encryptedData,
+                            startIdx * SECTOR_SIZE,
+                            sectorCountForThread
+                        )
                     }
                     futures.add(future)
                 }
@@ -524,21 +494,30 @@ class VolumeReader(
                 // Wait for all encryption threads to complete
                 futures.forEach { it.get() }
             } else {
-                // Sequential encryption for small writes (thread-safe method still ok)
-                for (i in 0 until sectorCount) {
-                    val sectorData = ByteArray(SECTOR_SIZE)
-                    System.arraycopy(data, i * SECTOR_SIZE, sectorData, 0, SECTOR_SIZE)
-                    val encryptedSector = xtsMode!!.encrypt(sectorData, baseTweakSector + i)
-                    System.arraycopy(encryptedSector, 0, encryptedData, i * SECTOR_SIZE, SECTOR_SIZE)
-                }
+                // Sequential batch encryption for small writes
+                xtsMode!!.encryptBatchThreadSafe(
+                    data,
+                    baseTweakSector,
+                    SECTOR_SIZE,
+                    encryptedData,
+                    0,
+                    sectorCount
+                )
             }
             
-            // Write all encrypted data in one I/O operation - lock only for I/O
-            ioLock.lock()
+            // Write all encrypted data in one I/O operation - writeLock for exclusive I/O
+            ioWriteLock.lock()
             try {
                 if (volumeFile != null) {
-                    volumeFile?.seek(startOffset)
-                    volumeFile?.write(encryptedData)
+                    // Positional write via FileChannel — thread-safe
+                    val channel = volumeFile!!.channel
+                    val buf = ByteBuffer.wrap(encryptedData)
+                    var written = 0
+                    while (written < encryptedData.size) {
+                        val w = channel.write(buf, startOffset + written)
+                        if (w <= 0) break
+                        written += w
+                    }
                 } else if (parcelFd != null) {
                     val fd = parcelFd!!.fileDescriptor
                     var written = 0
@@ -549,12 +528,115 @@ class VolumeReader(
                     }
                 }
             } finally {
-                ioLock.unlock()
+                ioWriteLock.unlock()
             }
             
             Result.success(Unit)
         } catch (e: Exception) {
             Log.e(TAG, "Error writing sectors starting at $startSector", e)
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Write sectors from a sub-range of a byte array, encrypting IN-PLACE.
+     * This avoids allocating a separate encryption output buffer (saves ~256KB–1MB per call).
+     * WARNING: The data in data[dataOffset..dataOffset+dataLength] is DESTROYED
+     * (overwritten with ciphertext). The caller must not need this data afterward.
+     *
+     * encryptBatchThreadSafe reads each sector into a scratch buffer before writing
+     * output, so using the same array for input and output is safe — even with
+     * parallel threads, each thread operates on non-overlapping sector ranges.
+     */
+    fun writeSectorsInPlace(startSector: Long, data: ByteArray, dataOffset: Int, dataLength: Int): Result<Unit> {
+        return try {
+            if (dataLength % SECTOR_SIZE != 0) {
+                return Result.failure(Exception("Data length must be a multiple of $SECTOR_SIZE"))
+            }
+            
+            if (masterKey == null || xtsMode == null) {
+                return Result.failure(Exception("Volume not mounted"))
+            }
+            
+            if (volumeFile == null && parcelFd == null) {
+                return Result.failure(Exception("Volume file not open"))
+            }
+            
+            val sectorCount = dataLength / SECTOR_SIZE
+            val volumeOffset = dataAreaOffset + (startSector * SECTOR_SIZE)
+            
+            if (volumeOffset + dataLength > volumeSize) {
+                return Result.failure(Exception("Write would exceed volume bounds"))
+            }
+            
+            // Encrypt in-place — data serves as both input and output
+            val baseTweakSector = (dataAreaOffset / SECTOR_SIZE) + startSector
+            
+            if (sectorCount >= 4) {
+                val numThreads = minOf(Runtime.getRuntime().availableProcessors().coerceIn(2, 8), sectorCount)
+                val sectorsPerThread = sectorCount / numThreads
+                val latch = java.util.concurrent.CountDownLatch(numThreads)
+                
+                for (threadIdx in 0 until numThreads) {
+                    val startIdx = threadIdx * sectorsPerThread
+                    val threadSectors = if (threadIdx == numThreads - 1) sectorCount - startIdx else sectorsPerThread
+                    
+                    encryptionExecutor.execute {
+                        try {
+                            xtsMode!!.encryptBatchThreadSafe(
+                                data,
+                                baseTweakSector + startIdx,
+                                SECTOR_SIZE,
+                                data,
+                                dataOffset + startIdx * SECTOR_SIZE,
+                                threadSectors
+                            )
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+                }
+                
+                latch.await()
+            } else {
+                xtsMode!!.encryptBatchThreadSafe(
+                    data,
+                    baseTweakSector,
+                    SECTOR_SIZE,
+                    data,
+                    dataOffset,
+                    sectorCount
+                )
+            }
+            
+            // Write the encrypted range
+            ioWriteLock.lock()
+            try {
+                if (volumeFile != null) {
+                    val channel = volumeFile!!.channel
+                    val buf = ByteBuffer.wrap(data, dataOffset, dataLength)
+                    var written = 0
+                    while (written < dataLength) {
+                        val w = channel.write(buf, volumeOffset + written)
+                        if (w <= 0) break
+                        written += w
+                    }
+                } else if (parcelFd != null) {
+                    val fd = parcelFd!!.fileDescriptor
+                    var written = 0
+                    while (written < dataLength) {
+                        val w = Os.pwrite(fd, data, dataOffset + written, dataLength - written, volumeOffset + written)
+                        if (w <= 0) break
+                        written += w
+                    }
+                }
+            } finally {
+                ioWriteLock.unlock()
+            }
+            
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error writing sectors in-place starting at $startSector", e)
             Result.failure(e)
         }
     }

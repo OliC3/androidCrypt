@@ -1,6 +1,7 @@
 package com.androidcrypt.app
 
 import android.Manifest
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -1218,6 +1219,8 @@ fun FileManagerScreen() {
                 action = CopyService.ACTION_COPY_FILE_TO_VOLUME
                 putExtra(CopyService.EXTRA_SOURCE_URI, uri)
                 putExtra(CopyService.EXTRA_VOLUME_PATH, selectedVolume)
+                clipData = ClipData.newRawUri("", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -1249,6 +1252,8 @@ fun FileManagerScreen() {
                 putExtra(CopyService.EXTRA_SOURCE_URI, uri)
                 putExtra(CopyService.EXTRA_VOLUME_PATH, selectedVolume)
                 putExtra(CopyService.EXTRA_FOLDER_NAME, folderName)
+                clipData = ClipData.newRawUri("", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

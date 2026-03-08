@@ -89,7 +89,12 @@ class CopyService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_COPY_FOLDER_TO_VOLUME -> {
-                val sourceUri = intent.getParcelableExtra<Uri>(EXTRA_SOURCE_URI)
+                val sourceUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_SOURCE_URI, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<Uri>(EXTRA_SOURCE_URI)
+                }
                 val volumePath = intent.getStringExtra(EXTRA_VOLUME_PATH)
                 val folderName = intent.getStringExtra(EXTRA_FOLDER_NAME)
                 
@@ -100,7 +105,12 @@ class CopyService : Service() {
                 }
             }
             ACTION_COPY_FILE_TO_VOLUME -> {
-                val sourceUri = intent.getParcelableExtra<Uri>(EXTRA_SOURCE_URI)
+                val sourceUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_SOURCE_URI, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<Uri>(EXTRA_SOURCE_URI)
+                }
                 val volumePath = intent.getStringExtra(EXTRA_VOLUME_PATH)
                 
                 if (sourceUri != null && volumePath != null) {
@@ -278,7 +288,7 @@ class CopyService : Service() {
                 val fileName = getFileNameFromUri(sourceUri)
                 val fileSize = getFileSizeFromUri(sourceUri)
                 
-                Log.d(TAG, "startFileCopy: fileName=$fileName, fileSize=$fileSize bytes (${fileSize / (1024 * 1024)} MB)")
+                Log.d(TAG, "startFileCopy: fileSize=${fileSize / (1024 * 1024)} MB")
                 
                 updateNotification("Copying: $fileName", 0, 1)
                 
@@ -292,12 +302,10 @@ class CopyService : Service() {
                 // Create file in volume
                 val filePath = "/$fileName"
                 if (!reader.exists(filePath)) {
-                    Log.d(TAG, "startFileCopy: Creating file entry for $filePath")
                     reader.createFile("/", fileName).getOrThrow()
                 }
                 
                 // Stream file directly to volume (no memory buffering)
-                Log.d(TAG, "startFileCopy: Starting streaming write for $filePath")
                 inputStream.use { stream ->
                     reader.writeFileStreaming(filePath, stream, fileSize) { bytesWritten ->
                         val percent = if (fileSize > 0) (bytesWritten * 100 / fileSize).toInt() else 0
@@ -307,7 +315,7 @@ class CopyService : Service() {
                     }.getOrThrow()
                 }
                 
-                Log.d(TAG, "startFileCopy: Streaming write completed for $filePath")
+                Log.d(TAG, "startFileCopy: Streaming write completed")
                 updateNotification("Complete: $fileName", 1, 1)
                 
                 // Notify DocumentsProvider
@@ -385,20 +393,34 @@ class CopyService : Service() {
     
     private fun getFileNameFromUri(uri: Uri): String {
         var fileName: String? = null
-        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                fileName = cursor.getString(0)
+        try {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0 && !cursor.isNull(idx)) {
+                        fileName = cursor.getString(idx)
+                    }
+                }
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query file name from URI", e)
         }
         return fileName ?: uri.lastPathSegment ?: "unknown"
     }
     
     private fun getFileSizeFromUri(uri: Uri): Long {
         var size = 0L
-        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                size = cursor.getLong(0)
+        try {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                    if (idx >= 0 && !cursor.isNull(idx)) {
+                        size = cursor.getLong(idx)
+                    }
+                }
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to query file size from URI", e)
         }
         return size
     }
@@ -550,7 +572,6 @@ class CopyService : Service() {
                         // Check if existing file is 0 bytes - if so, delete it and copy the new file
                         val existingInfo = reader.getFileInfo(filePath).getOrNull()
                         if (existingInfo != null && existingInfo.size == 0L && size > 0) {
-                            Log.d(TAG, "Deleting 0-byte file to overwrite: $filePath")
                             reader.delete(filePath)
                             // Don't skip - allow the copy to proceed
                         } else {
@@ -593,7 +614,7 @@ class CopyService : Service() {
                         // Don't log cancellation as error - it's expected on cancel
                         throw e
                     } catch (e: Exception) {
-                        Log.e(TAG, "Failed to read: $name", e)
+                        Log.e(TAG, "Failed to read file", e)
                     } finally {
                         readSemaphore.release()
                     }
@@ -619,15 +640,14 @@ class CopyService : Service() {
                 // Re-throw cancellation to properly propagate
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to write file: $newFilePath", e)
+                Log.e(TAG, "Failed to write file", e)
                 // Clean up 0-byte file that was created before the write failed
                 try {
                     if (reader.exists(newFilePath)) {
                         reader.delete(newFilePath)
-                        Log.d(TAG, "Cleaned up failed file: $newFilePath")
                     }
                 } catch (cleanupEx: Exception) {
-                    Log.w(TAG, "Failed to clean up 0-byte file: $newFilePath", cleanupEx)
+                    Log.w(TAG, "Failed to clean up 0-byte file", cleanupEx)
                 }
             }
         }
@@ -651,25 +671,20 @@ class CopyService : Service() {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to write large file: $newFilePath", e)
+                Log.e(TAG, "Failed to write large file", e)
                 // Clean up 0-byte file that was created before the write failed
                 try {
                     if (reader.exists(newFilePath)) {
                         reader.delete(newFilePath)
-                        Log.d(TAG, "Cleaned up failed large file: $newFilePath")
                     }
                 } catch (cleanupEx: Exception) {
-                    Log.w(TAG, "Failed to clean up 0-byte file: $newFilePath", cleanupEx)
+                    Log.w(TAG, "Failed to clean up 0-byte file", cleanupEx)
                 }
             }
         }
         
-        Log.d(TAG, "copyFolderToVolume: Wrote $filesWritten files to $newFolderPath")
-        
         // Process subdirectories
-        Log.d(TAG, "copyFolderToVolume: Processing ${subdirs.size} subdirectories in $newFolderPath")
         for ((docId, name) in subdirs) {
-            Log.d(TAG, "copyFolderToVolume: Entering subfolder: $name (docId=$docId)")
             copySubFolder(folderUri, docId, newFolderPath, name, reader, counter, onProgress)
         }
     }
@@ -720,7 +735,6 @@ class CopyService : Service() {
                         // Check if existing file is 0 bytes - if so, delete it and copy the new file
                         val existingInfo = reader.getFileInfo(filePath).getOrNull()
                         if (existingInfo != null && existingInfo.size == 0L && size > 0) {
-                            Log.d(TAG, "Deleting 0-byte file to overwrite: $filePath")
                             reader.delete(filePath)
                             // Don't skip - allow the copy to proceed
                         } else {
@@ -761,7 +775,7 @@ class CopyService : Service() {
                         // Don't log cancellation as error - it's expected on cancel
                         throw e
                     } catch (e: Exception) {
-                        Log.e(TAG, "Failed to read: $name", e)
+                        Log.e(TAG, "Failed to read file", e)
                     } finally {
                         readSemaphore.release()
                     }
@@ -785,15 +799,14 @@ class CopyService : Service() {
                 // Re-throw cancellation to properly propagate
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "copySubFolder: Failed to write file: $newFilePath", e)
+                Log.e(TAG, "copySubFolder: Failed to write file", e)
                 // Clean up 0-byte file that was created before the write failed
                 try {
                     if (reader.exists(newFilePath)) {
                         reader.delete(newFilePath)
-                        Log.d(TAG, "copySubFolder: Cleaned up failed file: $newFilePath")
                     }
                 } catch (cleanupEx: Exception) {
-                    Log.w(TAG, "copySubFolder: Failed to clean up 0-byte file: $newFilePath", cleanupEx)
+                    Log.w(TAG, "copySubFolder: Failed to clean up 0-byte file", cleanupEx)
                 }
             }
         }
@@ -816,22 +829,19 @@ class CopyService : Service() {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                Log.e(TAG, "copySubFolder: Failed to write large file: $newFilePath", e)
+                Log.e(TAG, "copySubFolder: Failed to write large file", e)
                 // Clean up 0-byte file that was created before the write failed
                 try {
                     if (reader.exists(newFilePath)) {
                         reader.delete(newFilePath)
-                        Log.d(TAG, "copySubFolder: Cleaned up failed large file: $newFilePath")
                     }
                 } catch (cleanupEx: Exception) {
-                    Log.w(TAG, "copySubFolder: Failed to clean up 0-byte file: $newFilePath", cleanupEx)
+                    Log.w(TAG, "copySubFolder: Failed to clean up 0-byte file", cleanupEx)
                 }
             }
         }
         
-        Log.d(TAG, "copySubFolder: Processing ${subdirs.size} subdirectories in $newFolderPath")
         for ((docId, name) in subdirs) {
-            Log.d(TAG, "copySubFolder: Entering subfolder: $name (docId=$docId)")
             copySubFolder(treeUri, docId, newFolderPath, name, reader, counter, onProgress)
         }
     }

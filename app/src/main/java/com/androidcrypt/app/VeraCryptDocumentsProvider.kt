@@ -34,6 +34,31 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         private const val ROOT_ID_PREFIX = "veracrypt_"
         // Set to false to disable debug logging for better performance
         private const val DEBUG_LOGGING = false
+
+        // Dedicated executor for background read-ahead — runs concurrently with onRead
+        // so it never blocks the calling thread waiting for the next chunk.
+        private val readAheadExecutor: java.util.concurrent.ExecutorService =
+            java.util.concurrent.Executors.newFixedThreadPool(4)
+
+        // Shared pool of HandlerThreads for ProxyFileDescriptor callbacks.
+        // openProxyFileDescriptor requires a Handler(Looper), so we need real Looper
+        // threads. Instead of spawning one per file (50+ for thumbnails), we share a
+        // small pool and round-robin across them.  Multiple callbacks can safely share
+        // a single Looper — Android dispatches onRead/onRelease sequentially per Looper.
+        private const val PROXY_HANDLER_POOL_SIZE = 4
+        private val proxyHandlerThreads: Array<HandlerThread> = Array(PROXY_HANDLER_POOL_SIZE) { i ->
+            HandlerThread("ProxyPool-$i").apply { start() }
+        }
+        private val proxyHandlerPool: Array<Handler> = Array(PROXY_HANDLER_POOL_SIZE) { i ->
+            Handler(proxyHandlerThreads[i].looper)
+        }
+        private val proxyHandlerCounter = java.util.concurrent.atomic.AtomicInteger(0)
+        
+        /** Round-robin a shared proxy Handler instead of spawning a new thread. */
+        private fun nextProxyHandler(): Handler {
+            val idx = proxyHandlerCounter.getAndIncrement() % PROXY_HANDLER_POOL_SIZE
+            return proxyHandlerPool[idx]
+        }
         
         private val DEFAULT_ROOT_PROJECTION = arrayOf(
             Root.COLUMN_ROOT_ID,
@@ -83,19 +108,19 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         private val videoCacheLock = Any()
         
         private fun isVideoFile(key: String): Boolean {
-            val lowerKey = key.lowercase()
             // Match Valv encrypted videos, paths containing /video, OR actual video extensions
-            return lowerKey.endsWith("-v.valv") || 
-                   lowerKey.contains("/video") ||
-                   lowerKey.endsWith(".mp4") ||
-                   lowerKey.endsWith(".mkv") ||
-                   lowerKey.endsWith(".avi") ||
-                   lowerKey.endsWith(".mov") ||
-                   lowerKey.endsWith(".webm") ||
-                   lowerKey.endsWith(".m4v") ||
-                   lowerKey.endsWith(".3gp") ||
-                   lowerKey.endsWith(".wmv") ||
-                   lowerKey.endsWith(".flv")
+            // Use ignoreCase to avoid allocating a lowercase copy
+            return key.endsWith("-v.valv", ignoreCase = true) || 
+                   key.contains("/video", ignoreCase = true) ||
+                   key.endsWith(".mp4", ignoreCase = true) ||
+                   key.endsWith(".mkv", ignoreCase = true) ||
+                   key.endsWith(".avi", ignoreCase = true) ||
+                   key.endsWith(".mov", ignoreCase = true) ||
+                   key.endsWith(".webm", ignoreCase = true) ||
+                   key.endsWith(".m4v", ignoreCase = true) ||
+                   key.endsWith(".3gp", ignoreCase = true) ||
+                   key.endsWith(".wmv", ignoreCase = true) ||
+                   key.endsWith(".flv", ignoreCase = true)
         }
         
         private fun isThumbnailFile(key: String): Boolean {
@@ -111,7 +136,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                         videoCache.remove(key)
                         return null
                     }
-                    Log.d("VeraCryptProvider", "VIDEO CACHE HIT: $key (${entry.second.size / 1024}KB)")
+                    if (DEBUG_LOGGING) Log.d("VeraCryptProvider", "VIDEO CACHE HIT: $key (${entry.second.size / 1024}KB)")
                     return entry.second
                 }
             }
@@ -131,7 +156,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 if (data.size > VIDEO_CACHE_MAX_SIZE) return
                 synchronized(videoCacheLock) {
                     videoCache[key] = Pair(System.currentTimeMillis(), data)
-                    Log.d("VeraCryptProvider", "VIDEO CACHED: $key (${data.size / 1024}KB) - ${videoCache.size} videos in cache")
+                    if (DEBUG_LOGGING) Log.d("VeraCryptProvider", "VIDEO CACHED: $key (${data.size / 1024}KB) - ${videoCache.size} videos in cache")
                 }
             } else if (isThumbnailFile(key)) {
                 if (data.size > THUMBNAIL_CACHE_MAX_SIZE) return
@@ -147,10 +172,6 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     // This is critical for performance - each reader caches directory/file/FAT data
     private val readerCache = mutableMapOf<String, FAT32Reader>()
     private val readerCacheLock = java.util.concurrent.locks.ReentrantLock()
-    
-    // Handler thread for proxy file descriptor callbacks
-    private val proxyHandlerThread = HandlerThread("ProxyFdHandler").apply { start() }
-    private val proxyHandler = Handler(proxyHandlerThread.looper)
     
     override fun onCreate(): Boolean {
         Log.d(TAG, "VeraCryptDocumentsProvider created")
@@ -179,7 +200,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 else -> false
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking child document: $parentDocumentId vs $documentId", e)
+            Log.e(TAG, "Error checking child document", e)
             return false
         }
     }
@@ -189,7 +210,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * This is required for proper navigation in file managers
      */
     override fun findDocumentPath(parentDocumentId: String?, childDocumentId: String): Path {
-        Log.d(TAG, "findDocumentPath: parent=$parentDocumentId, child=$childDocumentId")
+        if (DEBUG_LOGGING) Log.d(TAG, "findDocumentPath: parent=$parentDocumentId, child=$childDocumentId")
         
         try {
             val (rootId, childPath) = parseDocumentId(childDocumentId)
@@ -220,7 +241,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             return Path(rootId, pathComponents)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error finding document path: $childDocumentId", e)
+            Log.e(TAG, "Error finding document path", e)
             throw FileNotFoundException("Cannot find path for: $childDocumentId")
         }
     }
@@ -269,10 +290,10 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                         row.add(Root.COLUMN_AVAILABLE_BYTES, availableBytes)
                         row.add(Root.COLUMN_CAPACITY_BYTES, volumeInfo.dataAreaSize)
                         
-                        Log.d(TAG, "Added root: $rootId, label: ${fsInfo?.label}, available: $availableBytes bytes")
+                        if (DEBUG_LOGGING) Log.d(TAG, "Added root: $rootId, available: $availableBytes bytes")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error processing volume: $volumePath", e)
+                    Log.e(TAG, "Error processing volume", e)
                 }
             }
         } catch (e: Exception) {
@@ -286,7 +307,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Return metadata for a document (file or directory)
      */
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
-        Log.d(TAG, "queryDocument: $documentId")
+        if (DEBUG_LOGGING) Log.d(TAG, "queryDocument: $documentId")
         
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         
@@ -304,7 +325,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             includeFile(result, documentId, fileEntry)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error querying document: $documentId", e)
+            Log.e(TAG, "Error querying document", e)
             throw FileNotFoundException("Cannot find document: $documentId")
         }
         
@@ -315,7 +336,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Get document MIME type - required by some file managers
      */
     override fun getDocumentType(documentId: String): String {
-        Log.d(TAG, "getDocumentType: $documentId")
+        if (DEBUG_LOGGING) Log.d(TAG, "getDocumentType: $documentId")
         
         try {
             val (rootId, path) = parseDocumentId(documentId)
@@ -334,7 +355,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 fileEntry.mimeType ?: getMimeType(fileEntry)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting document type: $documentId", e)
+            Log.e(TAG, "Error getting document type", e)
             return "application/octet-stream"
         }
     }
@@ -350,6 +371,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         if (DEBUG_LOGGING) Log.d(TAG, "queryChildDocuments: $parentDocumentId")
         
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
+        val queryStart = System.currentTimeMillis()
         
         try {
             val (rootId, path) = parseDocumentId(parentDocumentId)
@@ -373,14 +395,20 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 includedCount++
             }
             
-            if (DEBUG_LOGGING) Log.d(TAG, "Found ${entries.size} children in $path (included=$includedCount, skipped=$skippedCount empty .valv files)")
+            val elapsed = System.currentTimeMillis() - queryStart
+            // Always log for large directories or slow queries
+            if (includedCount > 100 || elapsed > 1000) {
+                Log.d(TAG, "queryChildDocuments: $includedCount items (skipped=$skippedCount) in ${elapsed}ms")
+            } else if (DEBUG_LOGGING) {
+                Log.d(TAG, "Found ${entries.size} children (included=$includedCount, skipped=$skippedCount empty .valv files)")
+            }
             
             // Set notification URI so file manager can watch for changes
             val notifyUri = DocumentsContract.buildChildDocumentsUri(AUTHORITY, parentDocumentId)
             result.setNotificationUri(context?.contentResolver, notifyUri)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error querying child documents: $parentDocumentId", e)
+            Log.e(TAG, "Error querying child documents (after ${System.currentTimeMillis() - queryStart}ms)", e)
             // Return empty cursor on error
         }
         
@@ -403,7 +431,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             val volumePath = getVolumePathFromRootId(rootId)
             val fsReader = getOrCreateFileSystemReader(volumePath) ?: throw FileNotFoundException("Volume not mounted")
             
-            val fileEntry = fsReader.getFileInfo(path).getOrThrow()
+            val fileEntry = fsReader.getFileInfoWithClusterPublic(path).getOrThrow()
             if (DEBUG_LOGGING) Log.d(TAG, "openDocument: got fileEntry name=${fileEntry.name}, isDir=${fileEntry.isDirectory}, size=${fileEntry.size}")
             
             if (fileEntry.isDirectory) {
@@ -418,16 +446,19 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             // Use ProxyFileDescriptor for on-demand reads - no buffering, instant response
             val storageManager = context?.getSystemService(StorageManager::class.java)
                 ?: throw FileNotFoundException("StorageManager not available")
-            
-            val callback = EncryptedFileProxyCallback(fsReader, volumePath, path, fileEntry.size)
+
+            // Share a small pool of Looper threads instead of spawning one per file.
+            // Multiple ProxyFileDescriptorCallbacks safely share a single Handler.
+            val handler = nextProxyHandler()
+            val callback = EncryptedFileProxyCallback(fsReader, volumePath, path, fileEntry.size, fileEntry.firstCluster)
             return storageManager.openProxyFileDescriptor(
                 ParcelFileDescriptor.MODE_READ_ONLY,
                 callback,
-                proxyHandler
+                handler
             )
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error opening document: $documentId", e)
+            Log.e(TAG, "Error opening document", e)
             throw FileNotFoundException("Cannot open document: ${e.message}")
         }
     }
@@ -441,7 +472,8 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         private val fsReader: FAT32Reader,
         private val volumePath: String,
         private val path: String,
-        private val fileSize: Long
+        private val fileSize: Long,
+        private val firstCluster: Int  // Pre-resolved — avoids metadata lookup on every read
     ) : ProxyFileDescriptorCallback() {
         
         // Global cache key for this file
@@ -461,12 +493,12 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             if (useGlobalCache) {
                 localCachedData = getCachedFile(globalCacheKey)
                 if (localCachedData != null) {
-                    Log.d(TAG, "PROXY CALLBACK: path=$path size=${fileSize/1024}KB PREFETCHED from cache")
+                    if (DEBUG_LOGGING) Log.d(TAG, "PROXY CALLBACK: path=$path size=${fileSize/1024}KB PREFETCHED from cache")
                 } else {
-                    Log.d(TAG, "PROXY CALLBACK: path=$path size=${fileSize/1024}KB isVideo=${isVideoFile(globalCacheKey)} useGlobalCache=$useGlobalCache key=$globalCacheKey")
+                    if (DEBUG_LOGGING) Log.d(TAG, "PROXY CALLBACK: path=$path size=${fileSize/1024}KB isVideo=${isVideoFile(globalCacheKey)} useGlobalCache=$useGlobalCache key=$globalCacheKey")
                 }
             } else {
-                Log.d(TAG, "PROXY CALLBACK: path=$path size=${fileSize/1024}KB isVideo=${isVideoFile(globalCacheKey)} useGlobalCache=false")
+                if (DEBUG_LOGGING) Log.d(TAG, "PROXY CALLBACK: path=$path size=${fileSize/1024}KB isVideo=${isVideoFile(globalCacheKey)} useGlobalCache=false")
             }
         }
         
@@ -474,14 +506,23 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         @Volatile private var globalCacheLoaded = false
         
         // Use larger buffers for video files to sustain high throughput
-        private val isVideo = path.lowercase().let { 
-            it.endsWith(".mp4") || it.endsWith(".mkv") || it.endsWith(".avi") || 
-            it.endsWith(".mov") || it.endsWith(".webm") || it.endsWith(".m4v") ||
-            it.endsWith(".valv") // Valv encrypted video format
-        }
+        private val isVideo = 
+            path.endsWith(".mp4", ignoreCase = true) || path.endsWith(".mkv", ignoreCase = true) ||
+            path.endsWith(".avi", ignoreCase = true) || path.endsWith(".mov", ignoreCase = true) ||
+            path.endsWith(".webm", ignoreCase = true) || path.endsWith(".m4v", ignoreCase = true) ||
+            path.endsWith(".valv", ignoreCase = true) // Valv encrypted video format
         
-        // 1MB buffer for videos, 256KB for images/other files
-        private val cacheSize = if (isVideo || fileSize > 5 * 1024 * 1024) 1024 * 1024 else 256 * 1024
+        // Cache window sizing:
+        //   tiny  (<= 512KB): cache the whole file — eliminates every subsequent read
+        //   medium (<= 5MB) : 2MB window  — 3 fills max for a 5MB image
+        //   large (> 5MB)   : 4MB window  — sustains throughput for big files
+        //   video            : 4MB window  — large bursts for smooth playback
+        private val cacheSize = when {
+            isVideo                              -> 4 * 1024 * 1024
+            fileSize <= 512 * 1024              -> fileSize.toInt()
+            fileSize <= 5 * 1024 * 1024         -> 2 * 1024 * 1024
+            else                                -> 4 * 1024 * 1024
+        }
         
         // Double-buffering: current cache and read-ahead cache
         @Volatile private var cachedData: ByteArray? = null
@@ -527,12 +568,12 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                     if (!globalCacheLoaded) {
                         globalCacheLoaded = true
                         val readStart = System.currentTimeMillis()
-                        val fullData = fsReader.readFileRange(path, 0, fileSize.toInt()).getOrNull()
+                        val fullData = fsReader.readFileRangeByCluster(firstCluster, fileSize, 0, fileSize.toInt()).getOrNull()
                         if (fullData != null) {
                             putCachedFile(globalCacheKey, fullData)
                             localCachedData = fullData  // Also store locally
                             val readTime = System.currentTimeMillis() - readStart
-                            Log.d(TAG, "PROXY: Cached ${fullData.size/1024}KB in ${readTime}ms for $path")
+                            if (DEBUG_LOGGING) Log.d(TAG, "PROXY: Cached ${fullData.size/1024}KB in ${readTime}ms for $path")
                             
                             val copySize = minOf(bytesToRead, (fullData.size - offset).toInt())
                             if (copySize > 0 && offset < fullData.size) {
@@ -593,9 +634,9 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 val readStart = System.currentTimeMillis()
                 val readSize = minOf(cacheSize.toLong(), fileSize - offset).toInt()
                 
-                val readData = fsReader.readFileRange(path, offset, readSize).getOrThrow()
+                val readData = fsReader.readFileRangeByCluster(firstCluster, fileSize, offset, readSize).getOrThrow()
                 val readTime = System.currentTimeMillis() - readStart
-                if (readTime > 50) {
+                if (DEBUG_LOGGING && readTime > 50) {
                     Log.d(TAG, "PROXY: ${readData.size/1024}KB read in ${readTime}ms for $path")
                 }
                 
@@ -615,7 +656,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 return copySize
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Error reading $path at offset $offset", e)
+                Log.e(TAG, "Error reading file at offset $offset", e)
                 throw android.system.ErrnoException("onRead", android.system.OsConstants.EIO)
             }
         }
@@ -624,11 +665,15 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             if (nextOffset >= fileSize || readAheadInProgress) return
             
             readAheadInProgress = true
-            proxyHandler.post {
+            // Use the shared read-ahead executor — NOT the proxy handler thread.
+            // Posting to the proxy handler would queue behind pending onRead() calls,
+            // making read-ahead arrive AFTER the data is already needed. The executor
+            // runs this concurrently so the buffer is ready when onRead() needs it.
+            readAheadExecutor.execute {
                 try {
                     val readSize = minOf(cacheSize.toLong(), fileSize - nextOffset).toInt()
                     if (readSize > 0) {
-                        val data = fsReader.readFileRange(path, nextOffset, readSize).getOrNull()
+                        val data = fsReader.readFileRangeByCluster(firstCluster, fileSize, nextOffset, readSize).getOrNull()
                         if (data != null) {
                             synchronized(cacheLock) {
                                 readAheadData = data
@@ -649,6 +694,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 readAheadData = null
                 readAheadOffset = -1
             }
+            // HandlerThreads are pooled/shared — do NOT quit them here.
         }
     }
 
@@ -660,18 +706,33 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         val readFd = pipe[0]
         val writeFd = pipe[1]
         
-        // Read data from pipe and write to file system
+        // Stream data from pipe and write to file system using streaming API
         Thread {
             try {
                 ParcelFileDescriptor.AutoCloseInputStream(readFd).use { input ->
-                    val data = input.readBytes()
-                    fsReader.writeFile(path, data).getOrThrow()
-                    // Clear caches after write to ensure fresh data on next read
-                    fsReader.clearCache()
-                    Log.d(TAG, "Wrote ${data.size} bytes to $path")
+                    // Read all data to determine size (pipe doesn't provide length upfront).
+                    // Use ExposedBAOS to avoid the copy from toByteArray(): we wrap the
+                    // internal buffer directly in a ByteArrayInputStream.
+                    val buffer = ExposedByteArrayOutputStream(256 * 1024)
+                    val chunk = ByteArray(256 * 1024) // 256KB read chunks
+                    while (true) {
+                        val read = input.read(chunk)
+                        if (read == -1) break
+                        buffer.write(chunk, 0, read)
+                    }
+                    
+                    val totalBytes = buffer.internalCount
+                    
+                    if (DEBUG_LOGGING) Log.d(TAG, "openDocumentForWrite: Read $totalBytes bytes from pipe for $path, writing...")
+                    
+                    // Wrap internal buffer directly — zero-copy
+                    val dataStream = java.io.ByteArrayInputStream(buffer.internalBuffer, 0, totalBytes)
+                    fsReader.writeFileStreaming(path, dataStream, totalBytes.toLong()).getOrThrow()
+                    
+                    if (DEBUG_LOGGING) Log.d(TAG, "Wrote $totalBytes bytes to $path")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error writing to file: $path", e)
+                Log.e(TAG, "Error writing to file", e)
             }
         }.start()
         
@@ -686,7 +747,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         mimeType: String,
         displayName: String
     ): String? {
-        Log.d(TAG, "createDocument: parent=$parentDocumentId, mime=$mimeType, name=$displayName")
+        if (DEBUG_LOGGING) Log.d(TAG, "createDocument: parent=$parentDocumentId, mime=$mimeType, name=$displayName")
         
         try {
             val (rootId, parentPath) = parseDocumentId(parentDocumentId)
@@ -701,8 +762,10 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 fsReader.createFile(parentPath, displayName).getOrThrow()
             }
             
-            // Clear caches after write to ensure fresh data
-            fsReader.clearCache()
+            // Don't call clearCache() here - createFile/createDirectory already
+            // properly manage caches (remove parent directoryCache, add fileCache entry).
+            // Calling clearCache() would wipe the fileCache entry that was just added,
+            // causing the immediate queryDocument to fail with "File not found".
             
             val newDocumentId = getDocumentId(rootId, newEntry.path)
             
@@ -710,12 +773,12 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             val parentUri = DocumentsContract.buildDocumentUri(AUTHORITY, parentDocumentId)
             context?.contentResolver?.notifyChange(parentUri, null)
             
-            Log.d(TAG, "Created document: $newDocumentId")
+            if (DEBUG_LOGGING) Log.d(TAG, "Created document: $newDocumentId")
             
             return newDocumentId
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error creating document: $displayName", e)
+            Log.e(TAG, "Error creating document", e)
             throw FileNotFoundException("Cannot create document: ${e.message}")
         }
     }
@@ -724,7 +787,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Delete a document
      */
     override fun deleteDocument(documentId: String) {
-        Log.d(TAG, "deleteDocument: $documentId")
+        if (DEBUG_LOGGING) Log.d(TAG, "deleteDocument: $documentId")
         
         try {
             val (rootId, path) = parseDocumentId(documentId)
@@ -750,10 +813,10 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             val childrenUri = DocumentsContract.buildChildDocumentsUri(AUTHORITY, parentDocumentId)
             context?.contentResolver?.notifyChange(childrenUri, null)
             
-            Log.d(TAG, "Deleted document: $documentId, notified parent: $parentDocumentId")
+            if (DEBUG_LOGGING) Log.d(TAG, "Deleted document: $documentId, notified parent: $parentDocumentId")
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error deleting document: $documentId", e)
+            Log.e(TAG, "Error deleting document", e)
             throw FileNotFoundException("Cannot delete document: ${e.message}")
         }
     }
@@ -766,17 +829,17 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         sourceParentDocumentId: String,
         targetParentDocumentId: String
     ): String? {
-        Log.d(TAG, "moveDocument: source=$sourceDocumentId, from=$sourceParentDocumentId, to=$targetParentDocumentId")
+        if (DEBUG_LOGGING) Log.d(TAG, "moveDocument: source=$sourceDocumentId, from=$sourceParentDocumentId, to=$targetParentDocumentId")
         
         try {
-            // Copy then delete (simple implementation)
+            // Copy then delete
             val newDocId = copyDocument(sourceDocumentId, targetParentDocumentId)
             if (newDocId != null) {
                 deleteDocument(sourceDocumentId)
             }
             return newDocId
         } catch (e: Exception) {
-            Log.e(TAG, "Error moving document: $sourceDocumentId", e)
+            Log.e(TAG, "Error moving document", e)
             throw FileNotFoundException("Cannot move document: ${e.message}")
         }
     }
@@ -785,7 +848,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Copy a document to a target directory
      */
     override fun copyDocument(sourceDocumentId: String, targetParentDocumentId: String): String? {
-        Log.d(TAG, "copyDocument: source=$sourceDocumentId, targetParent=$targetParentDocumentId")
+        if (DEBUG_LOGGING) Log.d(TAG, "copyDocument: source=$sourceDocumentId, targetParent=$targetParentDocumentId")
         
         try {
             val (sourceRootId, sourcePath) = parseDocumentId(sourceDocumentId)
@@ -812,13 +875,13 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             }
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error copying document: $sourceDocumentId", e)
+            Log.e(TAG, "Error copying document", e)
             throw FileNotFoundException("Cannot copy document: ${e.message}")
         }
     }
     
     private fun copyFile(fsReader: FAT32Reader, sourcePath: String, targetParentPath: String, fileName: String, rootId: String): String {
-        Log.d(TAG, "copyFile: $sourcePath -> $targetParentPath/$fileName")
+        if (DEBUG_LOGGING) Log.d(TAG, "copyFile: $sourcePath -> $targetParentPath/$fileName")
         
         // Read source file content
         val content = fsReader.readFile(sourcePath).getOrThrow()
@@ -830,7 +893,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         fsReader.writeFile(newEntry.path, content).getOrThrow()
         
         val newDocumentId = getDocumentId(rootId, newEntry.path)
-        Log.d(TAG, "Copied file: $newDocumentId")
+        if (DEBUG_LOGGING) Log.d(TAG, "Copied file: $newDocumentId")
         
         // Notify parent changed
         val parentDocumentId = getDocumentId(rootId, targetParentPath)
@@ -841,15 +904,15 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     }
     
     private fun copyDirectoryRecursive(fsReader: FAT32Reader, sourcePath: String, targetParentPath: String, dirName: String, rootId: String): String {
-        Log.d(TAG, "copyDirectoryRecursive: $sourcePath -> $targetParentPath/$dirName")
+        if (DEBUG_LOGGING) Log.d(TAG, "copyDirectoryRecursive: $sourcePath -> $targetParentPath/$dirName")
         
         // Create the directory
         val newDir = fsReader.createDirectory(targetParentPath, dirName).getOrThrow()
-        Log.d(TAG, "Created directory: ${newDir.path}")
+        if (DEBUG_LOGGING) Log.d(TAG, "Created directory: ${newDir.path}")
         
         // Get source directory contents
         val children = fsReader.listDirectory(sourcePath).getOrThrow()
-        Log.d(TAG, "Copying ${children.size} children from $sourcePath")
+        if (DEBUG_LOGGING) Log.d(TAG, "Copying ${children.size} children")
         
         // Recursively copy all children
         for (child in children) {
@@ -862,7 +925,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         }
         
         val newDocumentId = getDocumentId(rootId, newDir.path)
-        Log.d(TAG, "Completed directory copy: $newDocumentId")
+        if (DEBUG_LOGGING) Log.d(TAG, "Completed directory copy: $newDocumentId")
         
         // Notify parent changed
         val parentDocumentId = getDocumentId(rootId, targetParentPath)
@@ -891,8 +954,6 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         
         val displayName = if (fileEntry.path == "/") "VeraCrypt Volume" else fileEntry.getDisplayName()
         val mimeType = if (fileEntry.isDirectory) DocumentsContract.Document.MIME_TYPE_DIR else (fileEntry.mimeType ?: getMimeType(fileEntry))
-        
-        Log.d(TAG, "includeFile: docId=$documentId, name=$displayName, isDir=${fileEntry.isDirectory}, size=${fileEntry.size}, flags=$flags, mime=$mimeType")
         
         val row = result.newRow()
         row.add(Document.COLUMN_DOCUMENT_ID, documentId)
@@ -940,7 +1001,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 // Initialize the file system reader
                 val initResult = fsReader.initialize()
                 if (initResult.isFailure) {
-                    Log.e(TAG, "Failed to initialize file system for $volumePath", initResult.exceptionOrNull())
+                    Log.e(TAG, "Failed to initialize file system", initResult.exceptionOrNull())
                     return null
                 }
                 // Cache for future use
@@ -1045,4 +1106,15 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         val rootUri = DocumentsContract.buildRootsUri(AUTHORITY)
         context?.contentResolver?.notifyChange(rootUri, null)
     }
+}
+
+/**
+ * ByteArrayOutputStream that exposes its internal buffer to avoid the copy in toByteArray().
+ * The `buf` field is `protected` in java.io.ByteArrayOutputStream, so subclassing gives access.
+ */
+private class ExposedByteArrayOutputStream(size: Int) : java.io.ByteArrayOutputStream(size) {
+    /** Direct reference to the internal buffer (may be larger than count). */
+    val internalBuffer: ByteArray get() = buf
+    /** Number of valid bytes written. */
+    val internalCount: Int get() = count
 }

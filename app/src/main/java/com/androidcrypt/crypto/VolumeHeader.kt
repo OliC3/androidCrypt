@@ -348,8 +348,20 @@ class XTSMode(private val key: ByteArray, private val algorithm: EncryptionAlgor
         return result
     }
     
+    // ThreadLocal cipher cache for parallel encryption (mirrors threadCiphers for decrypt)
+    private data class EncryptThreadCiphers(
+        val encrypt: Cipher,
+        val tweak: Cipher,
+        val tweakBytes: ByteArray = ByteArray(16),
+        val blockBuffer: ByteArray = ByteArray(16),
+        val sectorXored: ByteArray = ByteArray(512),
+        val tweaksLo: LongArray = LongArray(32),  // 512/16 blocks
+        val tweaksHi: LongArray = LongArray(32)
+    )
+    private val encryptThreadCiphers = ThreadLocal<EncryptThreadCiphers>()
+    
     /**
-     * Thread-safe encrypt for a single sector - creates its own buffers
+     * Thread-safe encrypt for a single sector - uses ThreadLocal cached ciphers
      * Use this for parallel encryption of multiple sectors
      */
     fun encryptSectorThreadSafe(data: ByteArray, dataUnitNo: Long): ByteArray {
@@ -360,21 +372,29 @@ class XTSMode(private val key: ByteArray, private val algorithm: EncryptionAlgor
         val result = ByteArray(data.size)
         val blockSize = algorithm.blockSize
         
-        // Create local buffers for thread safety
-        val localTweakBuffer = ByteArray(16)
-        val localBlockBuffer = ByteArray(16)
-        
-        // Create local cipher instances for thread safety
-        val keySpec1 = SecretKeySpec(key1, "AES")
-        val keySpec2 = SecretKeySpec(key2, "AES")
-        val localEncryptCipher = Cipher.getInstance("AES/ECB/NoPadding").apply {
-            init(Cipher.ENCRYPT_MODE, keySpec1)
+        // Use cached cipher instances from ThreadLocal (avoid creating per-call)
+        val ciphers = encryptThreadCiphers.get() ?: run {
+            val keySpec1 = SecretKeySpec(key1, "AES")
+            val keySpec2 = SecretKeySpec(key2, "AES")
+            val encryptCipher = Cipher.getInstance("AES/ECB/NoPadding").apply {
+                init(Cipher.ENCRYPT_MODE, keySpec1)
+            }
+            val tweakCipher = Cipher.getInstance("AES/ECB/NoPadding").apply {
+                init(Cipher.ENCRYPT_MODE, keySpec2)
+            }
+            EncryptThreadCiphers(
+                encryptCipher, tweakCipher,
+                ByteArray(16), ByteArray(16),
+                ByteArray(512), LongArray(32), LongArray(32)
+            ).also { encryptThreadCiphers.set(it) }
         }
-        val localTweakCipher = Cipher.getInstance("AES/ECB/NoPadding").apply {
-            init(Cipher.ENCRYPT_MODE, keySpec2)
-        }
+        val localEncryptCipher = ciphers.encrypt
+        val localTweakCipher = ciphers.tweak
+        val localTweakBuffer = ciphers.tweakBytes
+        val localBlockBuffer = ciphers.blockBuffer
         
         // Initialize tweak with data unit number
+        java.util.Arrays.fill(localTweakBuffer, 0.toByte())
         val tweakBuf = ByteBuffer.wrap(localTweakBuffer).order(ByteOrder.LITTLE_ENDIAN)
         tweakBuf.putLong(dataUnitNo)
         
@@ -404,6 +424,97 @@ class XTSMode(private val key: ByteArray, private val algorithm: EncryptionAlgor
         }
         
         return result
+    }
+    
+    /**
+     * Thread-safe batch encrypt for multiple consecutive sectors
+     * Optimized: creates cipher instances once, bulk XOR operations, minimal allocations
+     * Mirrors decryptBatchThreadSafe for write operations.
+     */
+    fun encryptBatchThreadSafe(
+        plainData: ByteArray,
+        startSectorNo: Long,
+        sectorSize: Int,
+        encryptedData: ByteArray,
+        startOffset: Int,
+        sectorCount: Int
+    ) {
+        val blockSize = 16
+        val blocksPerSector = sectorSize / blockSize
+        
+        val ciphers = encryptThreadCiphers.get() ?: run {
+            val keySpec1 = SecretKeySpec(key1, "AES")
+            val keySpec2 = SecretKeySpec(key2, "AES")
+            val encCipher = Cipher.getInstance("AES/ECB/NoPadding").apply {
+                init(Cipher.ENCRYPT_MODE, keySpec1)
+            }
+            val tweakCipher = Cipher.getInstance("AES/ECB/NoPadding").apply {
+                init(Cipher.ENCRYPT_MODE, keySpec2)
+            }
+            EncryptThreadCiphers(
+                encCipher, tweakCipher,
+                ByteArray(16), ByteArray(16),
+                ByteArray(sectorSize),
+                LongArray(blocksPerSector),
+                LongArray(blocksPerSector)
+            ).also { encryptThreadCiphers.set(it) }
+        }
+        val encCipher = ciphers.encrypt
+        val tweakCipher = ciphers.tweak
+        // Use thread-local scratch buffers (no per-call allocation)
+        val sectorXored = ciphers.sectorXored
+        val tweakBytes = ciphers.tweakBytes
+        val tweaksLo = ciphers.tweaksLo
+        val tweaksHi = ciphers.tweaksHi
+        
+        val tweakBuf = ByteBuffer.wrap(tweakBytes).order(ByteOrder.LITTLE_ENDIAN)
+        
+        for (s in 0 until sectorCount) {
+            val sectorOffset = startOffset + (s * sectorSize)
+            val sectorNo = startSectorNo + s
+            
+            // Initialize first tweak with sector number and encrypt
+            java.util.Arrays.fill(tweakBytes, 0.toByte())
+            tweakBuf.clear()
+            tweakBuf.putLong(sectorNo)
+            tweakCipher.doFinal(tweakBytes, 0, 16, tweakBytes, 0)
+            
+            // Pre-compute ALL tweaks for this sector
+            tweakBuf.clear()
+            var tLo = tweakBuf.long
+            var tHi = tweakBuf.long
+            
+            for (b in 0 until blocksPerSector) {
+                tweaksLo[b] = tLo
+                tweaksHi[b] = tHi
+                val carry = if (tHi < 0) 135L else 0L
+                tHi = (tHi shl 1) or (tLo ushr 63)
+                tLo = (tLo shl 1) xor carry
+            }
+            
+            // XOR entire sector with tweaks
+            for (b in 0 until blocksPerSector) {
+                val blockOff = b * 16
+                val dataOff = sectorOffset + blockOff
+                val dLo = readLongLE(plainData, dataOff)
+                val dHi = readLongLE(plainData, dataOff + 8)
+                writeLongLE(sectorXored, blockOff, dLo xor tweaksLo[b])
+                writeLongLE(sectorXored, blockOff + 8, dHi xor tweaksHi[b])
+            }
+            
+            // Encrypt entire sector in ONE cipher call
+            encCipher.doFinal(sectorXored, 0, sectorSize, sectorXored, 0)
+            
+            // XOR encrypted data with tweaks and write to output
+            for (b in 0 until blocksPerSector) {
+                val blockOff = b * 16
+                val dataOff = sectorOffset + blockOff
+                val dLo = readLongLE(sectorXored, blockOff) xor tweaksLo[b]
+                val dHi = readLongLE(sectorXored, blockOff + 8) xor tweaksHi[b]
+                writeLongLE(encryptedData, dataOff, dLo)
+                writeLongLE(encryptedData, dataOff + 8, dHi)
+            }
+        }
     }
     
     /**
