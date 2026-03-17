@@ -40,6 +40,12 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         private val readAheadExecutor: java.util.concurrent.ExecutorService =
             java.util.concurrent.Executors.newFixedThreadPool(4)
 
+        // Dedicated executor for background writes (openDocumentForWrite).
+        // Kept separate from readAheadExecutor so that a long-running write
+        // cannot starve read-ahead tasks (and vice-versa).
+        private val writeExecutor: java.util.concurrent.ExecutorService =
+            java.util.concurrent.Executors.newFixedThreadPool(2)
+
         // Shared pool of HandlerThreads for ProxyFileDescriptor callbacks.
         // openProxyFileDescriptor requires a Handler(Looper), so we need real Looper
         // threads. Instead of spawning one per file (50+ for thumbnails), we share a
@@ -168,10 +174,8 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         }
     }
     
-    // Cache FAT32Reader instances to avoid reinitializing for every operation
-    // This is critical for performance - each reader caches directory/file/FAT data
-    private val readerCache = mutableMapOf<String, FAT32Reader>()
-    private val readerCacheLock = java.util.concurrent.locks.ReentrantLock()
+    // FAT32Reader caching is now handled centrally by VolumeMountManager
+    // so that DocumentsProvider and CopyService share the same instance.
     
     override fun onCreate(): Boolean {
         Log.d(TAG, "VeraCryptDocumentsProvider created")
@@ -307,7 +311,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Return metadata for a document (file or directory)
      */
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
-        if (DEBUG_LOGGING) Log.d(TAG, "queryDocument: $documentId")
+        Log.d(TAG, "queryDocument: $documentId")
         
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         
@@ -368,7 +372,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         projection: Array<out String>?,
         sortOrder: String?
     ): Cursor {
-        if (DEBUG_LOGGING) Log.d(TAG, "queryChildDocuments: $parentDocumentId")
+        Log.d(TAG, "queryChildDocuments: $parentDocumentId")
         
         val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         val queryStart = System.currentTimeMillis()
@@ -379,6 +383,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             val fsReader = getOrCreateFileSystemReader(volumePath) ?: throw FileNotFoundException("Volume not mounted")
             
             val entries = fsReader.listDirectory(path).getOrThrow()
+                .sortedWith(compareBy<FileEntry> { !it.isDirectory }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name })
             
             var includedCount = 0
             var skippedCount = 0
@@ -396,12 +401,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             }
             
             val elapsed = System.currentTimeMillis() - queryStart
-            // Always log for large directories or slow queries
-            if (includedCount > 100 || elapsed > 1000) {
-                Log.d(TAG, "queryChildDocuments: $includedCount items (skipped=$skippedCount) in ${elapsed}ms")
-            } else if (DEBUG_LOGGING) {
-                Log.d(TAG, "Found ${entries.size} children (included=$includedCount, skipped=$skippedCount empty .valv files)")
-            }
+            Log.d(TAG, "queryChildDocuments: $includedCount items (skipped=$skippedCount) in ${elapsed}ms")
             
             // Set notification URI so file manager can watch for changes
             val notifyUri = DocumentsContract.buildChildDocumentsUri(AUTHORITY, parentDocumentId)
@@ -699,42 +699,38 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     }
 
     /**
-     * Open document for writing
+     * Open document for writing — uses streaming dynamic allocation so data
+     * flows directly from the pipe to the encrypted volume without buffering
+     * the entire file in memory first.
      */
     private fun openDocumentForWrite(documentId: String, fsReader: FAT32Reader, path: String): ParcelFileDescriptor {
         val pipe = ParcelFileDescriptor.createPipe()
         val readFd = pipe[0]
         val writeFd = pipe[1]
         
-        // Stream data from pipe and write to file system using streaming API
-        Thread {
+        // Stream data from pipe directly to the file system using dynamic allocation.
+        // This avoids buffering the entire file in memory (which was causing slowness
+        // and OOM for large files) by allocating clusters on-demand as data arrives.
+        // Uses the dedicated write executor so writes never compete with read-ahead
+        // for thread-pool slots.
+        writeExecutor.execute {
             try {
                 ParcelFileDescriptor.AutoCloseInputStream(readFd).use { input ->
-                    // Read all data to determine size (pipe doesn't provide length upfront).
-                    // Use ExposedBAOS to avoid the copy from toByteArray(): we wrap the
-                    // internal buffer directly in a ByteArrayInputStream.
-                    val buffer = ExposedByteArrayOutputStream(256 * 1024)
-                    val chunk = ByteArray(256 * 1024) // 256KB read chunks
-                    while (true) {
-                        val read = input.read(chunk)
-                        if (read == -1) break
-                        buffer.write(chunk, 0, read)
-                    }
+                    // Use a large buffered stream for efficient pipe reads (1MB buffer)
+                    val bufferedInput = java.io.BufferedInputStream(input, 1024 * 1024)
                     
-                    val totalBytes = buffer.internalCount
+                    fsReader.writeFileStreamingDynamic(path, bufferedInput) { bytesWritten ->
+                        if (DEBUG_LOGGING && bytesWritten % (10 * 1024 * 1024) == 0L) {
+                            Log.d(TAG, "openDocumentForWrite: ${bytesWritten / (1024 * 1024)}MB written to $path")
+                        }
+                    }.getOrThrow()
                     
-                    if (DEBUG_LOGGING) Log.d(TAG, "openDocumentForWrite: Read $totalBytes bytes from pipe for $path, writing...")
-                    
-                    // Wrap internal buffer directly — zero-copy
-                    val dataStream = java.io.ByteArrayInputStream(buffer.internalBuffer, 0, totalBytes)
-                    fsReader.writeFileStreaming(path, dataStream, totalBytes.toLong()).getOrThrow()
-                    
-                    if (DEBUG_LOGGING) Log.d(TAG, "Wrote $totalBytes bytes to $path")
+                    if (DEBUG_LOGGING) Log.d(TAG, "openDocumentForWrite: completed writing to $path")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error writing to file", e)
             }
-        }.start()
+        }
         
         return writeFd
     }
@@ -796,9 +792,6 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             
             fsReader.delete(path).getOrThrow()
             
-            // Clear caches after delete to ensure fresh data
-            fsReader.clearCache()
-            
             // Notify that the document was deleted
             val deletedUri = DocumentsContract.buildDocumentUri(AUTHORITY, documentId)
             context?.contentResolver?.notifyChange(deletedUri, null)
@@ -822,7 +815,8 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     }
     
     /**
-     * Move a document to a new parent directory
+     * Move a document to a new parent directory.
+     * Uses O(1) directory entry relocation instead of copy+delete.
      */
     override fun moveDocument(
         sourceDocumentId: String,
@@ -832,11 +826,31 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         if (DEBUG_LOGGING) Log.d(TAG, "moveDocument: source=$sourceDocumentId, from=$sourceParentDocumentId, to=$targetParentDocumentId")
         
         try {
-            // Copy then delete
-            val newDocId = copyDocument(sourceDocumentId, targetParentDocumentId)
-            if (newDocId != null) {
-                deleteDocument(sourceDocumentId)
+            val (sourceRootId, sourcePath) = parseDocumentId(sourceDocumentId)
+            val (targetRootId, targetParentPath) = parseDocumentId(targetParentDocumentId)
+            
+            // Cross-volume move falls back to copy+delete
+            if (sourceRootId != targetRootId) {
+                val newDocId = copyDocument(sourceDocumentId, targetParentDocumentId)
+                if (newDocId != null) {
+                    deleteDocument(sourceDocumentId)
+                }
+                return newDocId
             }
+            
+            val volumePath = getVolumePathFromRootId(sourceRootId)
+            val fsReader = getOrCreateFileSystemReader(volumePath) ?: throw FileNotFoundException("Volume not mounted")
+            
+            // O(1) move — relocate directory entry without touching data clusters
+            val newPath = fsReader.moveEntry(sourcePath, targetParentPath).getOrThrow()
+            val newDocId = "$sourceRootId:$newPath"
+            
+            // Notify changes
+            val sourceUri = DocumentsContract.buildDocumentUri(AUTHORITY, sourceDocumentId)
+            val targetUri = DocumentsContract.buildDocumentUri(AUTHORITY, newDocId)
+            context?.contentResolver?.notifyChange(sourceUri, null)
+            context?.contentResolver?.notifyChange(targetUri, null)
+            
             return newDocId
         } catch (e: Exception) {
             Log.e(TAG, "Error moving document", e)
@@ -883,16 +897,11 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     private fun copyFile(fsReader: FAT32Reader, sourcePath: String, targetParentPath: String, fileName: String, rootId: String): String {
         if (DEBUG_LOGGING) Log.d(TAG, "copyFile: $sourcePath -> $targetParentPath/$fileName")
         
-        // Read source file content
-        val content = fsReader.readFile(sourcePath).getOrThrow()
+        // Direct intra-volume copy — pre-allocates clusters, reads+writes in 8MB batches.
+        // Avoids pipe overhead and dynamic cluster allocation.
+        val newPath = fsReader.copyFileDirect(sourcePath, targetParentPath, fileName).getOrThrow()
         
-        // Create new file in target
-        val newEntry = fsReader.createFile(targetParentPath, fileName).getOrThrow()
-        
-        // Write content to new file
-        fsReader.writeFile(newEntry.path, content).getOrThrow()
-        
-        val newDocumentId = getDocumentId(rootId, newEntry.path)
+        val newDocumentId = getDocumentId(rootId, newPath)
         if (DEBUG_LOGGING) Log.d(TAG, "Copied file: $newDocumentId")
         
         // Notify parent changed
@@ -989,46 +998,16 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Call invalidateReaderCache() after write operations to ensure fresh data.
      */
     private fun getOrCreateFileSystemReader(volumePath: String): FAT32Reader? {
-        readerCacheLock.lock()
-        try {
-            // Return cached reader if available
-            readerCache[volumePath]?.let { return it }
-            
-            // Create new reader
-            val reader = VolumeMountManager.getVolumeReader(volumePath)
-            if (reader != null) {
-                val fsReader = FAT32Reader(reader)
-                // Initialize the file system reader
-                val initResult = fsReader.initialize()
-                if (initResult.isFailure) {
-                    Log.e(TAG, "Failed to initialize file system", initResult.exceptionOrNull())
-                    return null
-                }
-                // Cache for future use
-                readerCache[volumePath] = fsReader
-                return fsReader
-            }
-            
-            return null
-        } finally {
-            readerCacheLock.unlock()
-        }
+        // Delegate to VolumeMountManager's shared cache so that
+        // DocumentsProvider and CopyService share the same FAT32Reader.
+        return VolumeMountManager.getOrCreateFileSystemReader(volumePath)
     }
     
     /**
      * Invalidate cached reader for a volume (call after writes)
      */
     fun invalidateReaderCache(volumePath: String? = null) {
-        readerCacheLock.lock()
-        try {
-            if (volumePath != null) {
-                readerCache[volumePath]?.clearCache()
-            } else {
-                readerCache.values.forEach { it.clearCache() }
-            }
-        } finally {
-            readerCacheLock.unlock()
-        }
+        VolumeMountManager.invalidateFileSystemReader(volumePath)
     }
     
     /**
@@ -1087,13 +1066,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Called when a volume is unmounted
      */
     fun notifyVolumeUnmounted(volumePath: String) {
-        // Remove cached reader for this volume
-        readerCacheLock.lock()
-        try {
-            readerCache.remove(volumePath)
-        } finally {
-            readerCacheLock.unlock()
-        }
+        // VolumeMountManager handles reader cache cleanup on unmount
         
         val rootUri = DocumentsContract.buildRootsUri(AUTHORITY)
         context?.contentResolver?.notifyChange(rootUri, null)
@@ -1108,13 +1081,4 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     }
 }
 
-/**
- * ByteArrayOutputStream that exposes its internal buffer to avoid the copy in toByteArray().
- * The `buf` field is `protected` in java.io.ByteArrayOutputStream, so subclassing gives access.
- */
-private class ExposedByteArrayOutputStream(size: Int) : java.io.ByteArrayOutputStream(size) {
-    /** Direct reference to the internal buffer (may be larger than count). */
-    val internalBuffer: ByteArray get() = buf
-    /** Number of valid bytes written. */
-    val internalCount: Int get() = count
-}
+

@@ -16,7 +16,6 @@ import android.provider.DocumentsContract
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.androidcrypt.crypto.FAT32Reader
-import com.androidcrypt.crypto.VolumeReader
 import com.androidcrypt.crypto.VolumeMountManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -275,14 +274,8 @@ class CopyService : Service() {
         
         copyJob = serviceScope.launch {
             try {
-                val volumeReader: VolumeReader? = VolumeMountManager.getVolumeReader(volumePath)
-                if (volumeReader == null) {
-                    completeCopy(false, "Volume not mounted")
-                    return@launch
-                }
-                
-                val reader = FAT32Reader(volumeReader)
-                reader.initialize()
+                val reader = VolumeMountManager.getOrCreateFileSystemReader(volumePath)
+                    ?: run { completeCopy(false, "Volume not mounted"); return@launch }
                 
                 // Get file name and size
                 val fileName = getFileNameFromUri(sourceUri)
@@ -306,7 +299,10 @@ class CopyService : Service() {
                 }
                 
                 // Stream file directly to volume (no memory buffering)
-                inputStream.use { stream ->
+                // Wrap in BufferedInputStream to reduce content-provider syscalls
+                // when filling the 8MB write-batch buffer
+                val bufferedStream = java.io.BufferedInputStream(inputStream, 1024 * 1024) // 1MB
+                bufferedStream.use { stream ->
                     reader.writeFileStreaming(filePath, stream, fileSize) { bytesWritten ->
                         val percent = if (fileSize > 0) (bytesWritten * 100 / fileSize).toInt() else 0
                         if (bytesWritten % (50 * 1024 * 1024) < (256 * 1024)) { // Log every ~50MB
@@ -343,14 +339,8 @@ class CopyService : Service() {
         
         copyJob = serviceScope.launch {
             try {
-                val volumeReader: VolumeReader? = VolumeMountManager.getVolumeReader(volumePath)
-                if (volumeReader == null) {
-                    completeCopy(false, "Volume not mounted")
-                    return@launch
-                }
-                
-                val reader = FAT32Reader(volumeReader)
-                reader.initialize()
+                val reader = VolumeMountManager.getOrCreateFileSystemReader(volumePath)
+                    ?: run { completeCopy(false, "Volume not mounted"); return@launch }
                 
                 updateNotification("Counting files...", 0, 0)
                 
@@ -503,10 +493,15 @@ class CopyService : Service() {
         val size: Long
     )
     
-    // Threshold for streaming vs buffering (20MB)
-    // With 4 parallel readers + 8 buffer capacity, we could have ~12 files in memory
-    // 256MB heap limit / 12 = ~21MB max per file to be safe
-    private val LARGE_FILE_THRESHOLD = 20 * 1024 * 1024L
+    // Optimized thresholds and parallelism settings
+    // Small files: stream directly instead of buffering (reduces memory pressure)
+    // Large files: already streamed, just increase parallelism
+    private val LARGE_FILE_THRESHOLD = 5 * 1024 * 1024L  // 5MB threshold for streaming
+    
+    // Unified parallelism — all files share one semaphore.
+    // FAT metadata writes serialize on writeLock, so >4 concurrent writers
+    // just increases contention without improving throughput.
+    private val SMALL_FILE_PARALLELISM = 4
     
     // Counter class for progress tracking
     class CopyCounter(val total: Int) {
@@ -592,100 +587,106 @@ class CopyService : Service() {
             }
         }
         
-        // Process small files with parallel buffered reading
-        val fileChannel = Channel<PreReadFile>(capacity = 8)
-        val readSemaphore = Semaphore(4)
+        // UNIFIED QUEUE: merge small + large files into a single list and
+        // process them all with one semaphore. This prevents large files from
+        // sitting idle while small files drain, and vice-versa.
+        val allFiles = smallFiles.map { (docId, name, size) ->
+            LargeFileInfo(docId, name, newFolderPath, size)
+        } + largeFiles
+
+        val semaphore = Semaphore(SMALL_FILE_PARALLELISM)
+
+        val fileJobs = allFiles.map { file ->
+            launch(Dispatchers.IO) {
+                semaphore.acquire()
+                try {
+                    ensureActive()
+                    copySingleFileStreaming(file.docId, file.name, file.targetPath, folderUri, reader, file.size, counter, onProgress)
+                } finally {
+                    semaphore.release()
+                }
+            }
+        }
+
+        // PARALLEL SUBDIRS: launch all subdirectory copies concurrently instead
+        // of processing them depth-first one-by-one after all files finish.
+        // The FAT32 writeLock naturally serializes metadata operations, so the
+        // semaphore inside each sub-call is sufficient to prevent overload.
+        val subdirJobs = subdirs.map { (docId, name) ->
+            launch(Dispatchers.IO) {
+                copySubFolder(folderUri, docId, newFolderPath, name, reader, counter, onProgress)
+            }
+        }
+
+        // Wait for everything — files and subdirectories run concurrently
+        fileJobs.forEach { it.join() }
+        subdirJobs.forEach { it.join() }
+    }
+    
+    /**
+     * Copy a single file using streaming (no memory buffering)
+     * This is the optimized version that works for both small and large files
+     */
+    private suspend fun copySingleFileStreaming(
+        docId: String,
+        name: String,
+        targetPath: String,
+        folderUri: Uri,
+        reader: FAT32Reader,
+        fileSize: Long,
+        counter: CopyCounter,
+        onProgress: (String) -> Unit
+    ): Unit {
+        counter.increment()
+        onProgress("Copying ${counter.progressString()}: $name")
         
-        // Producer runs as child of current coroutine so cancel propagates
-        val producer = launch(Dispatchers.IO) {
-            val readJobs: List<Job> = smallFiles.map { (docId, name, size) ->
-                launch {
-                    readSemaphore.acquire()
-                    try {
-                        ensureActive() // Check if we should continue
-                        val fileUri = DocumentsContract.buildDocumentUriUsingTree(folderUri, docId)
-                        contentResolver.openInputStream(fileUri)?.use { inputStream ->
-                            val data = inputStream.readBytes()
-                            if (isActive) { // Only send if we're still running
-                                fileChannel.send(PreReadFile(name, newFolderPath, data, size))
-                            }
+        val newFilePath = if (targetPath == "/") "/$name" else "$targetPath/$name"
+        
+        try {
+            // Create file in volume
+            reader.createFile(targetPath, name).getOrThrow()
+            
+            // Stream directly from source to volume - no intermediate buffering
+            val fileUri = DocumentsContract.buildDocumentUriUsingTree(folderUri, docId)
+            contentResolver.openInputStream(fileUri)?.use { inputStream ->
+                // Use a large buffered stream for better I/O performance (1MB buffer)
+                val bufferedStream = java.io.BufferedInputStream(inputStream, 1024 * 1024)
+                
+                // Use actual file size for proper cluster allocation.
+                // If size is unknown (0 or -1), query it or fall back to dynamic streaming.
+                val actualSize = if (fileSize > 0) fileSize else {
+                    val queriedSize = getFileSizeFromUri(fileUri)
+                    if (queriedSize > 0) queriedSize else -1L
+                }
+                
+                if (actualSize > 0) {
+                    reader.writeFileStreaming(newFilePath, bufferedStream, actualSize) { bytesWritten ->
+                        if (bytesWritten % (10 * 1024 * 1024) == 0L) {
+                            onProgress("Copying ${counter.progressString()}: ${bytesWritten / (1024 * 1024)}MB")
                         }
-                    } catch (e: CancellationException) {
-                        // Don't log cancellation as error - it's expected on cancel
-                        throw e
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to read file", e)
-                    } finally {
-                        readSemaphore.release()
-                    }
+                    }.getOrThrow()
+                } else {
+                    // Unknown size: use dynamic streaming (allocates clusters on-demand)
+                    reader.writeFileStreamingDynamic(newFilePath, bufferedStream) { bytesWritten ->
+                        if (bytesWritten % (10 * 1024 * 1024) == 0L) {
+                            onProgress("Copying ${counter.progressString()}: ${bytesWritten / (1024 * 1024)}MB")
+                        }
+                    }.getOrThrow()
                 }
             }
-            readJobs.forEach { it.join() }
-            fileChannel.close()
-        }
-        
-        // Consumer: write small files
-        var filesWritten = 0
-        for (preRead in fileChannel) {
-            counter.increment()
-            onProgress("Copying ${counter.progressString()}: ${preRead.name}")
-            
-            val newFilePath = if (preRead.targetPath == "/") "/${preRead.name}" else "${preRead.targetPath}/${preRead.name}"
-            
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write file $name", e)
+            // Clean up 0-byte file that was created before the write failed
             try {
-                reader.createFile(preRead.targetPath, preRead.name).getOrThrow()
-                reader.writeFileStreaming(newFilePath, ByteArrayInputStream(preRead.data), preRead.data.size.toLong(), null).getOrThrow()
-                filesWritten++
-            } catch (e: CancellationException) {
-                // Re-throw cancellation to properly propagate
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to write file", e)
-                // Clean up 0-byte file that was created before the write failed
-                try {
-                    if (reader.exists(newFilePath)) {
-                        reader.delete(newFilePath)
-                    }
-                } catch (cleanupEx: Exception) {
-                    Log.w(TAG, "Failed to clean up 0-byte file", cleanupEx)
+                if (reader.exists(newFilePath)) {
+                    reader.delete(newFilePath)
                 }
+            } catch (cleanupEx: Exception) {
+                Log.w(TAG, "Failed to clean up 0-byte file", cleanupEx)
             }
-        }
-        
-        producer.join()
-        
-        // Process large files sequentially with streaming (no memory buffering)
-        for (largeFile in largeFiles) {
-            counter.increment()
-            onProgress("Copying ${counter.progressString()}: ${largeFile.name} (${largeFile.size / (1024 * 1024)}MB)")
-            
-            val newFilePath = if (largeFile.targetPath == "/") "/${largeFile.name}" else "${largeFile.targetPath}/${largeFile.name}"
-            
-            try {
-                val fileUri = DocumentsContract.buildDocumentUriUsingTree(folderUri, largeFile.docId)
-                contentResolver.openInputStream(fileUri)?.use { inputStream ->
-                    reader.createFile(largeFile.targetPath, largeFile.name).getOrThrow()
-                    reader.writeFileStreaming(newFilePath, inputStream, largeFile.size, null).getOrThrow()
-                    filesWritten++
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to write large file", e)
-                // Clean up 0-byte file that was created before the write failed
-                try {
-                    if (reader.exists(newFilePath)) {
-                        reader.delete(newFilePath)
-                    }
-                } catch (cleanupEx: Exception) {
-                    Log.w(TAG, "Failed to clean up 0-byte file", cleanupEx)
-                }
-            }
-        }
-        
-        // Process subdirectories
-        for ((docId, name) in subdirs) {
-            copySubFolder(folderUri, docId, newFolderPath, name, reader, counter, onProgress)
+            throw e
         }
     }
     
@@ -754,95 +755,35 @@ class CopyService : Service() {
             }
         }
         
-        val fileChannel = Channel<PreReadFile>(capacity = 8)
-        val readSemaphore = Semaphore(4)
-        
-        // Producer runs as child of current coroutine so cancel propagates
-        val producer = launch(Dispatchers.IO) {
-            val readJobs: List<Job> = smallFiles.map { (docId, name, size) ->
-                launch {
-                    readSemaphore.acquire()
-                    try {
-                        ensureActive() // Check if we should continue
-                        val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-                        contentResolver.openInputStream(fileUri)?.use { inputStream ->
-                            val data = inputStream.readBytes()
-                            if (isActive) { // Only send if we're still running
-                                fileChannel.send(PreReadFile(name, newFolderPath, data, size))
-                            }
-                        }
-                    } catch (e: CancellationException) {
-                        // Don't log cancellation as error - it's expected on cancel
-                        throw e
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to read file", e)
-                    } finally {
-                        readSemaphore.release()
-                    }
-                }
-            }
-            readJobs.forEach { it.join() }
-            fileChannel.close()
-        }
-        
-        // Process small files
-        for (preRead in fileChannel) {
-            counter.increment()
-            onProgress("Copying ${counter.progressString()}: ${preRead.name}")
-            
-            val newFilePath = if (preRead.targetPath == "/") "/${preRead.name}" else "${preRead.targetPath}/${preRead.name}"
-            
-            try {
-                reader.createFile(preRead.targetPath, preRead.name).getOrThrow()
-                reader.writeFileStreaming(newFilePath, ByteArrayInputStream(preRead.data), preRead.data.size.toLong(), null).getOrThrow()
-            } catch (e: CancellationException) {
-                // Re-throw cancellation to properly propagate
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "copySubFolder: Failed to write file", e)
-                // Clean up 0-byte file that was created before the write failed
+        // UNIFIED QUEUE: merge small + large files into a single list and
+        // process them all with one semaphore.
+        val allFiles = smallFiles.map { (docId, name, size) ->
+            LargeFileInfo(docId, name, newFolderPath, size)
+        } + largeFiles
+
+        val semaphore = Semaphore(SMALL_FILE_PARALLELISM)
+
+        val fileJobs = allFiles.map { file ->
+            launch(Dispatchers.IO) {
+                semaphore.acquire()
                 try {
-                    if (reader.exists(newFilePath)) {
-                        reader.delete(newFilePath)
-                    }
-                } catch (cleanupEx: Exception) {
-                    Log.w(TAG, "copySubFolder: Failed to clean up 0-byte file", cleanupEx)
+                    ensureActive()
+                    copySingleFileStreaming(file.docId, file.name, file.targetPath, treeUri, reader, file.size, counter, onProgress)
+                } finally {
+                    semaphore.release()
                 }
             }
         }
-        
-        producer.join()
-        
-        // Process large files sequentially with streaming
-        for (largeFile in largeFiles) {
-            counter.increment()
-            onProgress("Copying ${counter.progressString()}: ${largeFile.name} (${largeFile.size / (1024 * 1024)}MB)")
-            
-            val newFilePath = if (largeFile.targetPath == "/") "/${largeFile.name}" else "${largeFile.targetPath}/${largeFile.name}"
-            
-            try {
-                val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, largeFile.docId)
-                contentResolver.openInputStream(fileUri)?.use { inputStream ->
-                    reader.createFile(largeFile.targetPath, largeFile.name).getOrThrow()
-                    reader.writeFileStreaming(newFilePath, inputStream, largeFile.size, null).getOrThrow()
-                }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "copySubFolder: Failed to write large file", e)
-                // Clean up 0-byte file that was created before the write failed
-                try {
-                    if (reader.exists(newFilePath)) {
-                        reader.delete(newFilePath)
-                    }
-                } catch (cleanupEx: Exception) {
-                    Log.w(TAG, "copySubFolder: Failed to clean up 0-byte file", cleanupEx)
-                }
+
+        // PARALLEL SUBDIRS: launch all subdirectory copies concurrently.
+        val subdirJobs = subdirs.map { (docId, name) ->
+            launch(Dispatchers.IO) {
+                copySubFolder(treeUri, docId, newFolderPath, name, reader, counter, onProgress)
             }
         }
-        
-        for ((docId, name) in subdirs) {
-            copySubFolder(treeUri, docId, newFolderPath, name, reader, counter, onProgress)
-        }
+
+        // Wait for everything — files and subdirectories run concurrently
+        fileJobs.forEach { it.join() }
+        subdirJobs.forEach { it.join() }
     }
 }

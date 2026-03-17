@@ -323,8 +323,10 @@ class VolumeReader(
             val baseTweakSector = (dataAreaOffset / SECTOR_SIZE) + startSector
             
             val decryptStart = System.currentTimeMillis()
-            if (count >= 4) {
+            if (count >= 32) {
                 // Parallel batch decryption using thread pool (no thread creation overhead)
+                // Threshold of 32 sectors (16KB) avoids overhead of CountDownLatch + thread dispatch
+                // for small reads where sequential is faster
                 val numThreads = minOf(Runtime.getRuntime().availableProcessors(), 8, count)
                 val sectorsPerThread = count / numThreads
                 val latch = java.util.concurrent.CountDownLatch(numThreads)
@@ -352,7 +354,7 @@ class VolumeReader(
                 // Wait for all tasks to complete
                 latch.await()
             } else {
-                // Sequential decryption for very small reads (1-3 sectors)
+                // Sequential decryption for small reads (1-31 sectors) — avoids thread pool overhead
                 xtsMode!!.decryptBatchThreadSafe(
                     data,
                     baseTweakSector,
@@ -435,8 +437,12 @@ class VolumeReader(
     }
     
     /**
-     * Write multiple sectors efficiently with parallel encryption
-     * Uses ioLock only for file I/O, encryption happens outside the lock
+     * Write multiple sectors efficiently with parallel encryption.
+     * Encrypts in-place using a scratch buffer inside encryptBatchThreadSafe,
+     * avoiding a full data.copyOf() allocation. The caller's array IS modified
+     * (overwritten with ciphertext). Callers that need to preserve the original
+     * data must make their own copy before calling this method.
+     * Uses ioLock only for file I/O, encryption happens outside the lock.
      */
     fun writeSectors(startSector: Long, data: ByteArray): Result<Unit> {
         return try {
@@ -459,44 +465,48 @@ class VolumeReader(
                 return Result.failure(Exception("Write would exceed volume bounds"))
             }
             
-            // Encrypt all sectors OUTSIDE the lock
-            val encryptedData = ByteArray(data.size)
+            // Copy input so the caller's buffer is not modified (metadata writes
+            // are small — a few KB at most — and callers like batchWriteFATSectors
+            // reuse the same buffer for FAT1 and FAT2 writes).
+            // Large file-data writes already use writeSectorsInPlace() which
+            // encrypts the caller's buffer directly with zero extra allocation.
+            val encryptedData = data.copyOf()
             val baseTweakSector = (dataAreaOffset / SECTOR_SIZE) + startSector
             
-            // Use parallel batch encryption for writes (4+ sectors)
+            // Use parallel batch encryption for writes (32+ sectors)
             // encryptBatchThreadSafe processes sectors in bulk — one cipher call per sector,
             // no per-sector ByteArray allocation, uses ThreadLocal cached ciphers
-            if (sectorCount >= 4) {
+            if (sectorCount >= 32) {
                 val numThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 8).coerceAtMost(sectorCount)
-                val sectorsPerThread = (sectorCount + numThreads - 1) / numThreads
-                
-                val futures = mutableListOf<Future<*>>()
+                val sectorsPerThread = sectorCount / numThreads
+                val latch = java.util.concurrent.CountDownLatch(numThreads)
                 
                 for (threadIdx in 0 until numThreads) {
                     val startIdx = threadIdx * sectorsPerThread
                     val sectorCountForThread = if (threadIdx == numThreads - 1) sectorCount - startIdx else sectorsPerThread
                     
-                    if (startIdx >= sectorCount) break
-                    
-                    val future = encryptionExecutor.submit {
-                        xtsMode!!.encryptBatchThreadSafe(
-                            data,
-                            baseTweakSector + startIdx,
-                            SECTOR_SIZE,
-                            encryptedData,
-                            startIdx * SECTOR_SIZE,
-                            sectorCountForThread
-                        )
+                    encryptionExecutor.execute {
+                        try {
+                            xtsMode!!.encryptBatchThreadSafe(
+                                encryptedData,
+                                baseTweakSector + startIdx,
+                                SECTOR_SIZE,
+                                encryptedData,
+                                startIdx * SECTOR_SIZE,
+                                sectorCountForThread
+                            )
+                        } finally {
+                            latch.countDown()
+                        }
                     }
-                    futures.add(future)
                 }
                 
                 // Wait for all encryption threads to complete
-                futures.forEach { it.get() }
+                latch.await()
             } else {
-                // Sequential batch encryption for small writes
+                // Sequential batch encryption for small writes (1-31 sectors)
                 xtsMode!!.encryptBatchThreadSafe(
-                    data,
+                    encryptedData,
                     baseTweakSector,
                     SECTOR_SIZE,
                     encryptedData,
@@ -572,7 +582,7 @@ class VolumeReader(
             // Encrypt in-place — data serves as both input and output
             val baseTweakSector = (dataAreaOffset / SECTOR_SIZE) + startSector
             
-            if (sectorCount >= 4) {
+            if (sectorCount >= 32) {
                 val numThreads = minOf(Runtime.getRuntime().availableProcessors().coerceIn(2, 8), sectorCount)
                 val sectorsPerThread = sectorCount / numThreads
                 val latch = java.util.concurrent.CountDownLatch(numThreads)
@@ -704,12 +714,26 @@ class VolumeReader(
             parcelFd?.close()
             parcelFd = null
             masterKey = null
-            xtsMode = null  // Clear cached XTS instance
+            xtsMode?.close()  // Release native XTS context
+            xtsMode = null
             volumeInfo = null
             // Note: Don't shutdown executor as it may be reused
             Log.d(TAG, "Volume unmounted")
         } catch (e: Exception) {
             Log.e(TAG, "Error unmounting volume", e)
+        }
+    }
+    
+    /**
+     * Flush buffered writes to the underlying storage device.
+     * Uses fdatasync to flush data without metadata (faster than fsync).
+     */
+    fun sync() {
+        try {
+            val fd = parcelFd?.fileDescriptor ?: return
+            Os.fdatasync(fd)
+        } catch (e: Exception) {
+            Log.w(TAG, "fdatasync failed", e)
         }
     }
     

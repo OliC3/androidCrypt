@@ -1102,7 +1102,6 @@ fun FileManagerScreen() {
     var mountedVolumes by remember { mutableStateOf(VolumeMountManager.getMountedVolumes()) }
     var selectedVolume by remember { mutableStateOf<String?>(null) }
     var volumeInfo by remember { mutableStateOf<MountedVolumeInfo?>(null) }
-    var fileCount by remember { mutableStateOf(0) }
     var usedSpace by remember { mutableStateOf(0L) }
     var freeSpace by remember { mutableStateOf(0L) }
     var totalSpace by remember { mutableStateOf(0L) }
@@ -1134,11 +1133,8 @@ fun FileManagerScreen() {
                 statusMessage = ""
                 
                 try {
-                    val volumeReader = VolumeMountManager.getVolumeReader(selectedVolume!!)
-                    if (volumeReader != null) {
-                        val reader = FAT32Reader(volumeReader)
-                        reader.initialize()
-                        
+                    val reader = VolumeMountManager.getOrCreateFileSystemReader(selectedVolume!!)
+                    if (reader != null) {
                         withContext(Dispatchers.IO) {
                             exportFileFromVolume(context, reader, fileToExport, destUri)
                         }
@@ -1171,11 +1167,8 @@ fun FileManagerScreen() {
                 statusMessage = ""
                 
                 try {
-                    val volumeReader = VolumeMountManager.getVolumeReader(selectedVolume!!)
-                    if (volumeReader != null) {
-                        val reader = FAT32Reader(volumeReader)
-                        reader.initialize()
-                        
+                    val reader = VolumeMountManager.getOrCreateFileSystemReader(selectedVolume!!)
+                    if (reader != null) {
                         withContext(Dispatchers.IO) {
                             // Count files in the folder first
                             val totalFiles = countFilesInVolumeFolder(reader, folderToExport.path)
@@ -1286,21 +1279,16 @@ fun FileManagerScreen() {
                 statusMessage = "✓ ${state.message}"
                 statusColor = Color(0xFF4CAF50)
                 
-                // Refresh file count and space
+                // Refresh space stats (efficient — no recursive traversal)
                 if (selectedVolume != null) {
                     scope.launch(Dispatchers.IO) {
-                        val volumeReader = VolumeMountManager.getVolumeReader(selectedVolume!!)
-                        if (volumeReader != null) {
-                            val reader = FAT32Reader(volumeReader)
-                            reader.initialize()
-                            val rootFiles = reader.listDirectory("/").getOrDefault(emptyList())
-                            fileCount = countAllFiles(rootFiles, reader)
-                            usedSpace = calculateUsedSpace(rootFiles, reader)
-                            // Calculate accurate free/total space from cluster counting
+                        val reader = VolumeMountManager.getOrCreateFileSystemReader(selectedVolume!!)
+                        if (reader != null) {
                             totalSpace = reader.getTotalSpaceBytes()
                             val freeClusters = reader.countFreeClusters()
                             val clusterSize = reader.getClusterSize()
                             freeSpace = freeClusters.toLong() * clusterSize
+                            usedSpace = totalSpace - freeSpace
                         }
                     }
                 }
@@ -1332,20 +1320,18 @@ fun FileManagerScreen() {
             val volumeReader = VolumeMountManager.getVolumeReader(volumePath)
             volumeInfo = volumeReader?.volumeInfo
             
-            // Count files and used space
+            // Calculate space stats efficiently from FAT metadata (no recursive traversal)
             if (volumeReader != null) {
                 withContext(Dispatchers.IO) {
                     try {
-                        val reader = FAT32Reader(volumeReader)
-                        reader.initialize()
-                        val rootFiles = reader.listDirectory("/").getOrDefault(emptyList())
-                        fileCount = countAllFiles(rootFiles, reader)
-                        usedSpace = calculateUsedSpace(rootFiles, reader)
-                        // Calculate accurate free/total space from cluster counting
-                        totalSpace = reader.getTotalSpaceBytes()
-                        val freeClusters = reader.countFreeClusters()
-                        val clusterSize = reader.getClusterSize()
-                        freeSpace = freeClusters.toLong() * clusterSize
+                        val reader = VolumeMountManager.getOrCreateFileSystemReader(volumePath)
+                        if (reader != null) {
+                            totalSpace = reader.getTotalSpaceBytes()
+                            val freeClusters = reader.countFreeClusters()
+                            val clusterSize = reader.getClusterSize()
+                            freeSpace = freeClusters.toLong() * clusterSize
+                            usedSpace = totalSpace - freeSpace
+                        }
                     } catch (e: Exception) {
                         Log.e("FileManager", "Failed to get volume stats", e)
                     }
@@ -1518,11 +1504,6 @@ fun FileManagerScreen() {
                             )
                             Text(
                                 text = "Data Area: ${info.getDataAreaSizeMB()} MB",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Color.Black
-                            )
-                            Text(
-                                text = "Files: $fileCount",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = Color.Black
                             )
@@ -1814,11 +1795,12 @@ fun FileManagerScreen() {
     if (showFilePickerDialog) {
         val volumeReader = selectedVolume?.let { VolumeMountManager.getVolumeReader(it) }
         if (volumeReader != null) {
-            LaunchedEffect(currentPath) {
-                withContext(Dispatchers.IO) {
-                    val reader = FAT32Reader(volumeReader)
-                    reader.initialize()
-                    volumeFiles = reader.listDirectory(currentPath).getOrDefault(emptyList())
+            val fsReader = selectedVolume?.let { VolumeMountManager.getOrCreateFileSystemReader(it) }
+            if (fsReader != null) {
+                LaunchedEffect(currentPath) {
+                    withContext(Dispatchers.IO) {
+                        volumeFiles = fsReader.listDirectory(currentPath).getOrDefault(emptyList())
+                    }
                 }
             }
         }
@@ -1893,11 +1875,12 @@ fun FileManagerScreen() {
     if (showFolderPickerDialog) {
         val volumeReader = selectedVolume?.let { VolumeMountManager.getVolumeReader(it) }
         if (volumeReader != null) {
-            LaunchedEffect(currentPath) {
-                withContext(Dispatchers.IO) {
-                    val reader = FAT32Reader(volumeReader)
-                    reader.initialize()
-                    volumeFiles = reader.listDirectory(currentPath).getOrDefault(emptyList())
+            val fsReader = selectedVolume?.let { VolumeMountManager.getOrCreateFileSystemReader(it) }
+            if (fsReader != null) {
+                LaunchedEffect(currentPath) {
+                    withContext(Dispatchers.IO) {
+                        volumeFiles = fsReader.listDirectory(currentPath).getOrDefault(emptyList())
+                    }
                 }
             }
         }
@@ -1978,31 +1961,7 @@ fun FileManagerScreen() {
 
 // Helper functions
 
-private fun countAllFiles(entries: List<FileEntry>, reader: FAT32Reader): Int {
-    var count = 0
-    for (entry in entries) {
-        if (entry.isDirectory) {
-            val children = reader.listDirectory(entry.path).getOrDefault(emptyList())
-            count += countAllFiles(children, reader)
-        } else {
-            count++
-        }
-    }
-    return count
-}
 
-private fun calculateUsedSpace(entries: List<FileEntry>, reader: FAT32Reader): Long {
-    var total = 0L
-    for (entry in entries) {
-        if (entry.isDirectory) {
-            val children = reader.listDirectory(entry.path).getOrDefault(emptyList())
-            total += calculateUsedSpace(children, reader)
-        } else {
-            total += entry.size
-        }
-    }
-    return total
-}
 
 private fun formatFileSize(size: Long): String {
     return when {

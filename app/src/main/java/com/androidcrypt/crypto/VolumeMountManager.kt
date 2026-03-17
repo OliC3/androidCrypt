@@ -13,6 +13,8 @@ object VolumeMountManager {
     private const val TAG = "VolumeMountManager"
     private const val DOCUMENTS_AUTHORITY = "com.androidcrypt.documents"
     private val mountedVolumes = mutableMapOf<String, VolumeReader>()
+    private val fileSystemReaders = mutableMapOf<String, FAT32Reader>()
+    private val fsReaderLock = java.util.concurrent.locks.ReentrantLock()
     private var appContext: Context? = null
     
     // Callbacks for mount/unmount events
@@ -66,7 +68,6 @@ object VolumeMountManager {
             
             if (result.isSuccess) {
                 mountedVolumes[uriString] = reader
-                Log.d(TAG, "Volume mounted from URI: $uriString")
                 
                 // Notify callbacks
                 mountCallbacks.forEach { it(uriString) }
@@ -114,7 +115,6 @@ object VolumeMountManager {
             
             if (result.isSuccess) {
                 mountedVolumes[containerPath] = reader
-                Log.d(TAG, "Volume mounted: $containerPath")
                 
                 // Notify callbacks
                 mountCallbacks.forEach { it(containerPath) }
@@ -140,7 +140,9 @@ object VolumeMountManager {
             
             reader.unmount()
             mountedVolumes.remove(containerPath)
-            Log.d(TAG, "Volume unmounted: $containerPath")
+            // Remove shared file system reader
+            fsReaderLock.lock()
+            try { fileSystemReaders.remove(containerPath) } finally { fsReaderLock.unlock() }
             
             // Notify callbacks
             unmountCallbacks.forEach { it(containerPath) }
@@ -166,7 +168,9 @@ object VolumeMountManager {
         val paths = mountedVolumes.keys.toList()
         mountedVolumes.values.forEach { it.unmount() }
         mountedVolumes.clear()
-        Log.d(TAG, "All volumes unmounted")
+        // Clear all shared file system readers
+        fsReaderLock.lock()
+        try { fileSystemReaders.clear() } finally { fsReaderLock.unlock() }
         
         // Notify callbacks for each unmounted volume
         paths.forEach { path ->
@@ -196,6 +200,47 @@ object VolumeMountManager {
      */
     fun getMountedVolumes(): List<String> {
         return mountedVolumes.keys.toList()
+    }
+    
+    /**
+     * Get or create a shared FAT32Reader for the given volume.
+     * This ensures CopyService and DocumentsProvider share the same reader
+     * with warm caches, avoiding redundant FAT/directory reads.
+     */
+    fun getOrCreateFileSystemReader(volumePath: String): FAT32Reader? {
+        fsReaderLock.lock()
+        try {
+            fileSystemReaders[volumePath]?.let { return it }
+            
+            val reader = mountedVolumes[volumePath] ?: return null
+            val fsReader = FAT32Reader(reader)
+            val initResult = fsReader.initialize()
+            if (initResult.isFailure) {
+                Log.e(TAG, "Failed to initialize file system reader", initResult.exceptionOrNull())
+                return null
+            }
+            fileSystemReaders[volumePath] = fsReader
+            return fsReader
+        } finally {
+            fsReaderLock.unlock()
+        }
+    }
+    
+    /**
+     * Invalidate (clear caches of) the shared FAT32Reader for a volume.
+     * Call after external write operations that may have changed the file system.
+     */
+    fun invalidateFileSystemReader(volumePath: String? = null) {
+        fsReaderLock.lock()
+        try {
+            if (volumePath != null) {
+                fileSystemReaders[volumePath]?.clearCache()
+            } else {
+                fileSystemReaders.values.forEach { it.clearCache() }
+            }
+        } finally {
+            fsReaderLock.unlock()
+        }
     }
     
     /**
