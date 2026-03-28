@@ -23,7 +23,7 @@ set_target_properties(xts_aes_native PROPERTIES
 )
 
 # Deterministic build ID for reproducible builds (F-Droid verification)
-target_link_options(xts_aes_native PRIVATE "-Wl,--build-id=sha1")
+target_link_options(xts_aes_native PRIVATE "-Wl,--build-id=none")
 
 # Aggressive optimization for crypto hot paths
 # CRYPTOPP_DISABLE_ASM: Twofish.c references x64 assembly stubs (twofish_enc_blk
