@@ -22,6 +22,9 @@ set_target_properties(xts_aes_native PROPERTIES
     CXX_STANDARD_REQUIRED ON
 )
 
+# Deterministic build ID for reproducible builds (F-Droid verification)
+target_link_options(xts_aes_native PRIVATE "-Wl,--build-id=sha1")
+
 # Aggressive optimization for crypto hot paths
 # CRYPTOPP_DISABLE_ASM: Twofish.c references x64 assembly stubs (twofish_enc_blk
 # etc.) that are not available; disable the ASM path so the portable C
