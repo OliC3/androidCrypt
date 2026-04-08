@@ -688,8 +688,13 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         }
         
         override fun onRelease() {
-            // Zero decrypted data to prevent it lingering in memory
-            localCachedData?.fill(0)
+            // Zero decrypted data to prevent it lingering in memory.
+            // But only if we own this data (not from the global cache) — if useGlobalCache
+            // is true, localCachedData is the SAME reference as the global cache entry.
+            // Zeroing it would corrupt the global cache for all future reads.
+            if (!useGlobalCache) {
+                localCachedData?.fill(0)
+            }
             localCachedData = null
             synchronized(cacheLock) {
                 cachedData?.fill(0)

@@ -207,13 +207,6 @@ class VolumeReader(
         
         // Derive max key length needed across all algorithms
         val maxDkLen = EncryptionAlgorithm.entries.maxOf { it.keySize }
-        val derivedKey = PBKDF2.deriveKey(
-            password = passwordBytes,
-            salt = fullHeader.copyOfRange(0, SALT_SIZE),  // Normal header salt at offset 0
-            iterations = iterations,
-            hashAlgorithm = HashAlgorithm.SHA512,
-            dkLen = maxDkLen
-        )
         
         // VeraCrypt hidden volume layout (from src/Common/Volumes.h):
         //   Normal header:   offset 0
@@ -290,7 +283,6 @@ class VolumeReader(
         
         // Zero password bytes — no longer needed
         passwordBytes.fill(0)
-        derivedKey.fill(0)
         
         if (decryptedHeader == null || matchedAlgorithm == null) {
             Log.e(TAG, "Header validation failed - no algorithm produced valid magic bytes")

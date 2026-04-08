@@ -1793,20 +1793,23 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                     batchWriteFATSectors(fatUpdates)
                 }
                 
-                // Update directory entry with first cluster and actual file size
-                val clusterData = dirEntry.dirClusterData
+                // Re-read directory cluster from disk to pick up any modifications
+                // made between Phase 1 and Phase 3 (e.g., other files created in
+                // the same directory by concurrent SAF operations). Using the stale
+                // dirEntry.dirClusterData would overwrite those new entries.
+                val freshClusterData = volumeReader.readSectors(dirEntry.dirSector, bs.sectorsPerCluster).getOrThrow()
                 val offset = dirEntry.entryOffset
                 val newFirstCluster = if (allClusters.isNotEmpty()) allClusters[0] else 0
                 
-                java.nio.ByteBuffer.wrap(clusterData, offset + 26, 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                java.nio.ByteBuffer.wrap(freshClusterData, offset + 26, 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                     .putShort((newFirstCluster and 0xFFFF).toShort())
-                java.nio.ByteBuffer.wrap(clusterData, offset + 20, 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                java.nio.ByteBuffer.wrap(freshClusterData, offset + 20, 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                     .putShort((newFirstCluster shr 16).toShort())
-                java.nio.ByteBuffer.wrap(clusterData, offset + 28, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                java.nio.ByteBuffer.wrap(freshClusterData, offset + 28, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN)
                     .putInt((totalBytesWritten and 0xFFFFFFFFL).toInt())
                 
                 // Write back modified directory cluster
-                volumeReader.writeSectors(dirEntry.dirSector, clusterData).getOrThrow()
+                volumeReader.writeSectors(dirEntry.dirSector, freshClusterData).getOrThrow()
             }
             
             fileCache.remove(path)

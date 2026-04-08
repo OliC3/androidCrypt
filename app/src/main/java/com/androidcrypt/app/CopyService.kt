@@ -358,7 +358,13 @@ class CopyService : Service() {
                 // Notify DocumentsProvider
                 notifyVolumeChanged(volumePath)
                 
-                completeCopy(true, "Folder copied successfully! ($totalFiles files)")
+                val failedCount = counter.failedFiles.size
+                if (failedCount > 0) {
+                    val successCount = totalFiles - failedCount
+                    completeCopy(false, "Copied $successCount/$totalFiles files. $failedCount failed: ${counter.failedFiles.take(5).joinToString(", ")}")
+                } else {
+                    completeCopy(true, "Folder copied successfully! ($totalFiles files)")
+                }
                 
             } catch (e: CancellationException) {
                 completeCopy(false, "Copy cancelled")
@@ -508,8 +514,17 @@ class CopyService : Service() {
         var current: Int = 0
             private set
         
+        // Track files that failed so we can report them at the end
+        private val _failedFiles = mutableListOf<String>()
+        val failedFiles: List<String> get() = _failedFiles
+        
         fun increment() {
             current++
+        }
+        
+        @Synchronized
+        fun addFailure(name: String) {
+            _failedFiles.add(name)
         }
         
         fun progressString(): String = "$current/$total"
@@ -602,6 +617,13 @@ class CopyService : Service() {
                 try {
                     ensureActive()
                     copySingleFileStreaming(file.docId, file.name, file.targetPath, folderUri, reader, file.size, counter, onProgress)
+                } catch (e: CancellationException) {
+                    throw e // Propagate cancellation (user pressed Cancel)
+                } catch (e: Exception) {
+                    // Log failure but don't cancel siblings — other files should continue
+                    Log.e(TAG, "Failed to copy file: ${file.name}", e)
+                    counter.addFailure(file.name)
+                    onProgress("Failed ${file.name}: ${e.message}")
                 } finally {
                     semaphore.release()
                 }
@@ -648,7 +670,9 @@ class CopyService : Service() {
             
             // Stream directly from source to volume - no intermediate buffering
             val fileUri = DocumentsContract.buildDocumentUriUsingTree(folderUri, docId)
-            contentResolver.openInputStream(fileUri)?.use { inputStream ->
+            val inputStream = contentResolver.openInputStream(fileUri)
+                ?: throw Exception("Could not open input stream for $name")
+            inputStream.use { inputStream ->
                 // Use a large buffered stream for better I/O performance (1MB buffer)
                 val bufferedStream = java.io.BufferedInputStream(inputStream, 1024 * 1024)
                 
@@ -769,6 +793,13 @@ class CopyService : Service() {
                 try {
                     ensureActive()
                     copySingleFileStreaming(file.docId, file.name, file.targetPath, treeUri, reader, file.size, counter, onProgress)
+                } catch (e: CancellationException) {
+                    throw e // Propagate cancellation (user pressed Cancel)
+                } catch (e: Exception) {
+                    // Log failure but don't cancel siblings — other files should continue
+                    Log.e(TAG, "Failed to copy file: ${file.name}", e)
+                    counter.addFailure(file.name)
+                    onProgress("Failed ${file.name}: ${e.message}")
                 } finally {
                     semaphore.release()
                 }
