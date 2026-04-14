@@ -50,6 +50,14 @@ android {
             )
         }
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true  // android.util.Log → no-op in JVM unit tests
+        unitTests.all { test ->
+            // Make the Linux host build of libxts_aes_native.so visible to the JVM test runner
+            val nativeLibDir = layout.projectDirectory.dir("src/test/resources/lib/linux-x86_64").asFile
+            test.jvmArgs("-Djava.library.path=${nativeLibDir.absolutePath}")
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11

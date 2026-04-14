@@ -136,7 +136,9 @@ class VolumeReader(
         if (DEBUG_LOGGING) Log.d(TAG, "Opening container URI: $uri, size: $volumeSize bytes")
         
         // Read both normal header AND hidden header area (first 128KB covers both)
-        val headerReadSize = (VolumeConstants.VOLUME_HEADER_GROUP_SIZE).toInt().coerceAtMost(volumeSize.toInt())
+        // Use Long arithmetic to avoid overflow: volumeSize.toInt() wraps to 0 for exact
+        // multiples of 4 GiB (e.g. 80 GiB, 400 GiB) and goes negative for other large sizes.
+        val headerReadSize = VolumeConstants.VOLUME_HEADER_GROUP_SIZE.coerceAtMost(volumeSize).toInt()
         val headerBytes = ByteArray(headerReadSize)
         val fd = parcelFd!!.fileDescriptor
         val fis = FileInputStream(fd)
@@ -167,7 +169,9 @@ class VolumeReader(
         if (DEBUG_LOGGING) Log.d(TAG, "Opening container: $containerPath, size: $volumeSize bytes")
         
         // Read enough for both normal header (offset 0) and hidden header (offset 64KB)
-        val headerReadSize = (VolumeConstants.VOLUME_HEADER_GROUP_SIZE).toInt().coerceAtMost(volumeSize.toInt())
+        // Use Long arithmetic to avoid overflow: volumeSize.toInt() wraps to 0 for exact
+        // multiples of 4 GiB (e.g. 80 GiB, 400 GiB) and goes negative for other large sizes.
+        val headerReadSize = VolumeConstants.VOLUME_HEADER_GROUP_SIZE.coerceAtMost(volumeSize).toInt()
         val fullHeader = ByteArray(headerReadSize)
         volumeFile?.seek(0)
         volumeFile?.readFully(fullHeader)

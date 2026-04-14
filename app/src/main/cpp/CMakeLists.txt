@@ -13,8 +13,8 @@ target_include_directories(xts_aes_native PRIVATE
 )
 
 target_link_libraries(xts_aes_native
-    android
-    log
+    $<$<PLATFORM_ID:Android>:android>
+    $<$<PLATFORM_ID:Android>:log>
 )
 
 set_target_properties(xts_aes_native PROPERTIES

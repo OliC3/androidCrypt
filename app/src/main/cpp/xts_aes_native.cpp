@@ -32,6 +32,7 @@
 #define SERPENT_KS_WORDS 140   // 140 x uint32 = 560-byte key schedule
 
 #include "Twofish.h"
+#include <new>        // std::nothrow
 
 /* -----------------------------------------------------------------------
    VeraCrypt-compatible constants (from src/Common/Crypto.h / Xts.h)

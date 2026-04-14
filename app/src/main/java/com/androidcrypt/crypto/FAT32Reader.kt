@@ -136,7 +136,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         val reservedSectors: Int,
         val numberOfFATs: Int,
         val totalSectors: Long,
-        val sectorsPerFAT: Int,
+        val sectorsPerFAT: Long,
         val rootDirFirstCluster: Int,
         val volumeLabel: String,
         val fsType: String
@@ -166,12 +166,12 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             val totalSectors16 = buffer.getShort(19).toInt() and 0xFFFF
             val sectorsPerFAT16 = buffer.getShort(22).toInt() and 0xFFFF
             val totalSectors32 = buffer.getInt(32)
-            val sectorsPerFAT32 = buffer.getInt(36)
+            val sectorsPerFAT32 = buffer.getInt(36).toLong() and 0xFFFFFFFFL  // treat as unsigned
             val rootDirFirstCluster = buffer.getInt(44)
             
             // Determine FAT type
             val totalSectors = if (totalSectors16 != 0) totalSectors16.toLong() else totalSectors32.toLong()
-            val sectorsPerFAT = if (sectorsPerFAT16 != 0) sectorsPerFAT16 else sectorsPerFAT32
+            val sectorsPerFAT: Long = if (sectorsPerFAT16 != 0) sectorsPerFAT16.toLong() else sectorsPerFAT32
             
             // Read volume label and FS type
             val volumeLabel = if (sectorsPerFAT16 == 0) {
@@ -291,14 +291,15 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
 
         val start = System.currentTimeMillis()
         var freeClusters = 0
-        var sectorOffset = 0
+        var sectorOffset = 0L
         // 1 MB per I/O call — maximises sequential throughput & parallel decrypt
         val ioChunkSectors = 2048
 
         while (sectorOffset < totalFatSectors) {
-            val readCount = minOf(ioChunkSectors, totalFatSectors - sectorOffset)
+            // .toInt() is always safe: result is bounded by ioChunkSectors (2048)
+            val readCount = minOf(ioChunkSectors.toLong(), totalFatSectors - sectorOffset).toInt()
             val chunkData = volumeReader.readSectors(
-                (fatStartSector + sectorOffset).toLong(), readCount
+                fatStartSector + sectorOffset, readCount
             ).getOrNull() ?: break
 
             // ---- store in fatBlockCache (fatBlockSectors-sized slices) ----
@@ -307,7 +308,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             // but the free-cluster count (computed below) is still exact.
             var blockLocalOffset = 0
             while (blockLocalOffset < readCount) {
-                val blockKey = sectorOffset + blockLocalOffset
+                val blockKey = (sectorOffset + blockLocalOffset).toInt()
                 val blockSectors = minOf(fatBlockSectors, readCount - blockLocalOffset)
                 val startByte = blockLocalOffset * SECTOR_SIZE
                 val endByte = startByte + blockSectors * SECTOR_SIZE
@@ -321,7 +322,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
 
             // ---- count free clusters in this chunk ----
-            val chunkStartByte = sectorOffset.toLong() * SECTOR_SIZE
+            val chunkStartByte = sectorOffset * SECTOR_SIZE
             val firstCluster = maxOf((chunkStartByte / 4).toInt(), 2) // entries 0-1 reserved
             val lastCluster = minOf(
                 ((chunkStartByte + readCount * SECTOR_SIZE) / 4).toInt(),
@@ -1175,7 +1176,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
      */
     private data class WriteAllocation(
         val clusters: List<Int>,
-        val firstDataSector: Int,
+        val firstDataSector: Long,
         val clusterSize: Int,
         val sectorsPerCluster: Int
     )
@@ -1344,7 +1345,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 System.arraycopy(data, dataOffset, writeBuf!!, 0, toWrite)
                 
                 val firstCluster = allocation.clusters[clusterIndex]
-                val clusterSector = allocation.firstDataSector.toLong() + (firstCluster - 2).toLong() * allocation.sectorsPerCluster
+                val clusterSector = allocation.firstDataSector + (firstCluster - 2).toLong() * allocation.sectorsPerCluster
                 // Encrypt in-place and write — avoids allocating a separate encrypted copy
                 volumeReader.writeSectorsInPlace(clusterSector, writeBuf!!, 0, batchBytes).getOrThrow()
                 
@@ -1553,7 +1554,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                     }
                     
                     val runCluster = allocation.clusters[clusterIndex + batchOffset]
-                    val runSector = allocation.firstDataSector.toLong() + ((runCluster - 2).toLong() * allocation.sectorsPerCluster)
+                    val runSector = allocation.firstDataSector + ((runCluster - 2).toLong() * allocation.sectorsPerCluster)
                     val runBytes = runLength * allocation.clusterSize
                     val srcOffset = batchOffset * allocation.clusterSize
                     

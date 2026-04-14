@@ -244,7 +244,7 @@ class VolumeCreator {
         private fun formatFAT32(raf: RandomAccessFile, masterKey: ByteArray, totalBytes: Long, algorithm: EncryptionAlgorithm = EncryptionAlgorithm.AES) {
             // Data area size = total file size - all 4 headers (256KB)
             val dataAreaSize = totalBytes - TOTAL_HEADERS_SIZE
-            val sectorCount = (dataAreaSize / SECTOR_SIZE).toInt()
+            val sectorCount = dataAreaSize / SECTOR_SIZE
             
             // Calculate FAT32 parameters
             val sectorsPerCluster = 8  // 4KB clusters
@@ -315,7 +315,7 @@ class VolumeCreator {
             bootSector[30] = 0
             bootSector[31] = 0
             
-            // Total sectors 32
+            // Total sectors 32 (Long — fits in on-disk 32-bit unsigned field for FAT32 volumes up to 2 TiB)
             val totalSectors = sectorCount
             bootSector[32] = (totalSectors and 0xFF).toByte()
             bootSector[33] = (totalSectors shr 8 and 0xFF).toByte()
@@ -769,12 +769,12 @@ class VolumeCreator {
             hiddenDataAreaSize: Long,
             algorithm: EncryptionAlgorithm
         ) {
-            val sectorCount = (hiddenDataAreaSize / SECTOR_SIZE).toInt()
+            val sectorCount = hiddenDataAreaSize / SECTOR_SIZE
             val sectorsPerCluster = 8
             val reservedSectors = 32
             val numberOfFATs = 2
             val rootDirFirstCluster = 2
-            
+
             val clusterCount = (sectorCount - reservedSectors) / (sectorsPerCluster + 1)
             val sectorsPerFAT = (clusterCount * 4 + SECTOR_SIZE - 1) / SECTOR_SIZE
             
