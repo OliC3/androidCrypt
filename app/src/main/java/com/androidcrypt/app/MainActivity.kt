@@ -1,19 +1,24 @@
 package com.androidcrypt.app
 
 import android.Manifest
+import android.app.Activity
 import android.content.ClipData
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.provider.DocumentsContract
+import android.provider.Settings
 import android.provider.OpenableColumns
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
@@ -82,7 +87,22 @@ class MainActivity : ComponentActivity() {
         
         // Request storage permission if needed
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Android 11+: Scoped storage, no permission needed for app-specific directory
+            // Android 11+: MANAGE_EXTERNAL_STORAGE cannot be granted via requestPermissionLauncher.
+            // It requires sending the user to a dedicated Settings screen.  Without it being
+            // granted at runtime, ACTION_OPEN_DOCUMENT_TREE blocks selection of many common
+            // folders (Downloads, DCIM, etc.) with "can't use this folder".
+            if (!Environment.isExternalStorageManager()) {
+                try {
+                    startActivity(
+                        Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                            data = Uri.fromParts("package", packageName, null)
+                        }
+                    )
+                } catch (e: Exception) {
+                    // Fallback for devices that don't support the per-app screen
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                }
+            }
         } else {
             if (ContextCompat.checkSelfPermission(
                     this,
@@ -1575,38 +1595,12 @@ fun FileManagerScreen() {
         }
     }
     
-    // Folder picker launcher for copying folders from device
-    val folderPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { uri ->
-        if (uri != null && selectedVolume != null) {
-            // Take persistent permission for the folder
-            val takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            context.contentResolver.takePersistableUriPermission(uri, takeFlags)
-            
-            // Get folder name and start the CopyService
-            val folderName = getFolderNameFromUri(context, uri)
-            
-            val intent = Intent(context, CopyService::class.java).apply {
-                action = CopyService.ACTION_COPY_FOLDER_TO_VOLUME
-                putExtra(CopyService.EXTRA_SOURCE_URI, uri)
-                putExtra(CopyService.EXTRA_VOLUME_PATH, selectedVolume)
-                putExtra(CopyService.EXTRA_FOLDER_NAME, folderName)
-                clipData = ClipData.newRawUri("", uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
-            
-            isCopying = true
-            copyProgress = "Starting copy service..."
-            statusMessage = ""
-        }
-    }
+    // State that drives the custom in-app folder browser.
+    // ACTION_OPEN_DOCUMENT_TREE (SAF) cannot be used here because Android 11+ hard-codes
+    // certain directories (Downloads root, storage root, SD card root, etc.) as unselectable
+    // regardless of permissions — that is what produces "can't use this folder".  Since the
+    // app holds MANAGE_EXTERNAL_STORAGE we can browse the real file system directly instead.
+    var showDeviceFolderPicker by remember { mutableStateOf(false) }
     
     // Observe CopyService state
     val copyState by CopyService.copyState.collectAsStateWithLifecycle()
@@ -1958,7 +1952,7 @@ fun FileManagerScreen() {
                 
                 // Copy folder from device button
                 Button(
-                    onClick = { folderPickerLauncher.launch(null) },
+                    onClick = { showDeviceFolderPicker = true },
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !isCopying,
                     colors = ButtonDefaults.buttonColors(
@@ -2301,6 +2295,30 @@ fun FileManagerScreen() {
                 }) {
                     Text("Cancel")
                 }
+            }
+        )
+    }
+
+    // In-app folder browser — bypasses SAF restrictions
+    if (showDeviceFolderPicker) {
+        DeviceFolderPickerDialog(
+            onDismiss = { showDeviceFolderPicker = false },
+            onFolderSelected = { selectedDir ->
+                showDeviceFolderPicker = false
+                val vol = selectedVolume ?: return@DeviceFolderPickerDialog
+                val intent = Intent(context, CopyService::class.java).apply {
+                    action = CopyService.ACTION_COPY_FOLDER_PATH_TO_VOLUME
+                    putExtra(CopyService.EXTRA_SOURCE_PATH, selectedDir.absolutePath)
+                    putExtra(CopyService.EXTRA_VOLUME_PATH, vol)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+                isCopying = true
+                copyProgress = "Starting copy service..."
+                statusMessage = ""
             }
         )
     }
@@ -2929,4 +2947,133 @@ private fun findFileInFolder(context: android.content.Context, folderUri: Uri, f
         }
     }
     return null
+}
+/**
+ * Custom in-app folder browser that uses java.io.File directly.
+ *
+ * Android 11+ hard-codes certain directories (Downloads root, storage root, SD card root)
+ * as unselectable in ACTION_OPEN_DOCUMENT_TREE regardless of the app's permissions — this
+ * produces the "Can't use this folder" error in the system picker.  Since the app holds
+ * MANAGE_EXTERNAL_STORAGE we can walk the real file system without going through SAF at all.
+ */
+@Composable
+private fun DeviceFolderPickerDialog(
+    onDismiss: () -> Unit,
+    onFolderSelected: (java.io.File) -> Unit
+) {
+    var currentDir by remember {
+        mutableStateOf(android.os.Environment.getExternalStorageDirectory())
+    }
+
+    // Sorted list of sub-directories in the current directory
+    val subDirs = remember(currentDir) {
+        currentDir.listFiles()
+            ?.filter { it.isDirectory && !it.isHidden }
+            ?.sortedBy { it.name.lowercase() }
+            ?: emptyList()
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = currentDir.absolutePath,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 2
+            )
+        },
+        text = {
+            androidx.compose.foundation.lazy.LazyColumn(
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                // ".." row — navigate to parent
+                val storageRoot = android.os.Environment.getExternalStorageDirectory()
+                if (currentDir.absolutePath != storageRoot.absolutePath &&
+                    currentDir.parentFile != null
+                ) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { currentDir = currentDir.parentFile!! }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ArrowBack,
+                                contentDescription = "Go up",
+                                modifier = Modifier.size(20.dp),
+                                tint = Color(0xFF1565C0)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("..", style = MaterialTheme.typography.bodyMedium)
+                        }
+                        HorizontalDivider()
+                    }
+                }
+
+                if (subDirs.isEmpty()) {
+                    item {
+                        Text(
+                            text = "(no sub-folders)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray,
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        )
+                    }
+                }
+
+                items(subDirs) { dir ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // Tap the folder name/icon area to select this folder for copying
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { onFolderSelected(dir) }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Add,
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp),
+                                tint = Color(0xFFFFA000)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(dir.name, style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    "Tap to select",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color.Gray
+                                )
+                            }
+                        }
+                        // Chevron navigates INTO this folder
+                        IconButton(onClick = { currentDir = dir }) {
+                            Icon(
+                                imageVector = Icons.Default.ArrowForward,
+                                contentDescription = "Open folder",
+                                tint = Color(0xFF1565C0)
+                            )
+                        }
+                    }
+                    HorizontalDivider()
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = { onFolderSelected(currentDir) }) {
+                Text("Copy \"${currentDir.name}\"")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }

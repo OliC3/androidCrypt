@@ -38,10 +38,12 @@ class CopyService : Service() {
         // Action constants
         const val ACTION_COPY_FOLDER_TO_VOLUME = "copy_folder_to_volume"
         const val ACTION_COPY_FILE_TO_VOLUME = "copy_file_to_volume"
+        const val ACTION_COPY_FOLDER_PATH_TO_VOLUME = "copy_folder_path_to_volume" // java.io.File-based, bypasses SAF
         const val ACTION_CANCEL = "cancel_copy"
         
         // Extra keys
         const val EXTRA_SOURCE_URI = "source_uri"
+        const val EXTRA_SOURCE_PATH = "source_path" // absolute file-system path for File-based copy
         const val EXTRA_VOLUME_PATH = "volume_path"
         const val EXTRA_FOLDER_NAME = "folder_name"
         
@@ -118,6 +120,20 @@ class CopyService : Service() {
                     startFileCopy(sourceUri, volumePath)
                 }
             }
+            ACTION_COPY_FOLDER_PATH_TO_VOLUME -> {
+                // File-based folder copy — bypasses SAF restrictions entirely.
+                // Used when the app has MANAGE_EXTERNAL_STORAGE and shows its own folder browser.
+                val sourcePath = intent.getStringExtra(EXTRA_SOURCE_PATH)
+                val volumePath = intent.getStringExtra(EXTRA_VOLUME_PATH)
+                if (sourcePath != null && volumePath != null) {
+                    val sourceDir = java.io.File(sourcePath)
+                    if (sourceDir.isDirectory) {
+                        startForeground(NOTIFICATION_ID, createNotification("Preparing to copy..."))
+                        acquireWakeLock()
+                        startFolderCopyFromPath(sourceDir, volumePath)
+                    }
+                }
+            }
         }
         
         return START_NOT_STICKY
@@ -127,6 +143,7 @@ class CopyService : Service() {
         super.onDestroy()
         cancelCopy()
         releaseWakeLock()
+        _isRunning.value = false  // Always reset so a future service instance isn't blocked
         serviceScope.cancel()
     }
     
@@ -375,6 +392,150 @@ class CopyService : Service() {
         }
     }
     
+    // ── File-based folder copy (bypasses SAF ACTION_OPEN_DOCUMENT_TREE restrictions) ───────────
+
+    private fun startFolderCopyFromPath(sourceDir: java.io.File, volumePath: String) {
+        if (_isRunning.value) {
+            Log.w(TAG, "Copy already in progress")
+            return
+        }
+
+        _isRunning.value = true
+        _copyState.value = CopyState.Copying("Counting files...", 0, 0)
+
+        copyJob = serviceScope.launch {
+            try {
+                val reader = VolumeMountManager.getOrCreateFileSystemReader(volumePath)
+                    ?: run { completeCopy(false, "Volume not mounted"); return@launch }
+
+                updateNotification("Counting files...", 0, 0)
+
+                val totalFiles = countFilesInDirectory(sourceDir)
+                val counter = CopyCounter(totalFiles)
+
+                updateNotification("Copying 0/$totalFiles files...", 0, totalFiles)
+
+                copyFolderToVolumeFromPath(sourceDir, "/", reader, counter) { progress ->
+                    updateNotification(progress, counter.current, counter.total)
+                }
+
+                notifyVolumeChanged(volumePath)
+
+                val failedCount = counter.failedFiles.size
+                if (failedCount > 0) {
+                    val successCount = totalFiles - failedCount
+                    completeCopy(false, "Copied $successCount/$totalFiles files. $failedCount failed: ${counter.failedFiles.take(5).joinToString(", ")}")
+                } else {
+                    completeCopy(true, "Folder copied successfully! ($totalFiles files)")
+                }
+            } catch (e: CancellationException) {
+                completeCopy(false, "Copy cancelled")
+            } catch (e: Exception) {
+                Log.e(TAG, "Folder copy from path failed", e)
+                completeCopy(false, "Copy failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun countFilesInDirectory(dir: java.io.File): Int {
+        var count = 0
+        dir.listFiles()?.forEach { entry ->
+            if (entry.isDirectory) count += countFilesInDirectory(entry) else count++
+        }
+        return count
+    }
+
+    private suspend fun copyFolderToVolumeFromPath(
+        sourceDir: java.io.File,
+        targetPath: String,
+        reader: FAT32Reader,
+        counter: CopyCounter,
+        onProgress: (String) -> Unit
+    ): Unit = coroutineScope {
+        val folderName = sourceDir.name
+        val newFolderPath = if (targetPath == "/") "/$folderName" else "$targetPath/$folderName"
+
+        if (!reader.exists(newFolderPath)) {
+            reader.createDirectory(targetPath, folderName).getOrThrow()
+        }
+
+        val entries = sourceDir.listFiles() ?: return@coroutineScope
+        val files = entries.filter { it.isFile }
+        val subdirs = entries.filter { it.isDirectory }
+
+        val semaphore = kotlinx.coroutines.sync.Semaphore(SMALL_FILE_PARALLELISM)
+
+        val fileJobs = files.map { file ->
+            launch(Dispatchers.IO) {
+                semaphore.acquire()
+                try {
+                    ensureActive()
+                    counter.increment()
+                    onProgress("Copying ${counter.progressString()}: ${file.name}")
+
+                    val filePath = "$newFolderPath/${file.name}"
+                    var shouldCopy = true
+                    if (reader.exists(filePath)) {
+                        val existingInfo = reader.getFileInfo(filePath).getOrNull()
+                        val sourceSize = file.length()
+                        if (existingInfo == null ||
+                            (existingInfo.size == 0L && sourceSize > 0) ||
+                            (existingInfo.size != sourceSize && sourceSize > 0)) {
+                            // 0-byte entry, unknown info, or size mismatch (partial/corrupted) — re-copy
+                            try { reader.delete(filePath) } catch (_: Exception) {}
+                        } else {
+                            shouldCopy = false
+                        }
+                    }
+
+                    if (shouldCopy) {
+                        try {
+                            reader.createFile(newFolderPath, file.name).getOrThrow()
+                            java.io.BufferedInputStream(file.inputStream(), 1024 * 1024).use { stream ->
+                                if (file.length() > 0) {
+                                    reader.writeFileStreaming(filePath, stream, file.length()) { bytesWritten ->
+                                        if (bytesWritten % (10 * 1024 * 1024) == 0L) {
+                                            onProgress("Copying ${counter.progressString()}: ${bytesWritten / (1024 * 1024)}MB")
+                                        }
+                                    }.getOrThrow()
+                                }
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            // Clean up any partial/0-byte entry left behind by the failed write
+                            try {
+                                if (reader.exists(filePath)) reader.delete(filePath)
+                            } catch (cleanupEx: Exception) {
+                                Log.w(TAG, "Failed to clean up partial entry: ${file.name}", cleanupEx)
+                            }
+                            throw e  // Re-throw so the outer catch reports the failure
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to copy file: ${file.name}", e)
+                    counter.addFailure(file.name)
+                    onProgress("Failed ${file.name}: ${e.message}")
+                } finally {
+                    semaphore.release()
+                }
+            }
+        }
+
+        val subdirJobs = subdirs.map { dir ->
+            launch(Dispatchers.IO) {
+                copyFolderToVolumeFromPath(dir, newFolderPath, reader, counter, onProgress)
+            }
+        }
+
+        fileJobs.forEach { it.join() }
+        subdirJobs.forEach { it.join() }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+
     private fun notifyVolumeChanged(volumePath: String) {
         try {
             val authority = "com.androidcrypt.documents"
@@ -579,11 +740,12 @@ class CopyService : Service() {
                     val filePath = if (newFolderPath == "/") "/$name" else "$newFolderPath/$name"
                     var shouldCopy = true
                     if (reader.exists(filePath)) {
-                        // Check if existing file is 0 bytes - if so, delete it and copy the new file
+                        // Check if existing file is 0 bytes or size-mismatched — if so, delete and re-copy
                         val existingInfo = reader.getFileInfo(filePath).getOrNull()
-                        if (existingInfo != null && existingInfo.size == 0L && size > 0) {
-                            reader.delete(filePath)
-                            // Don't skip - allow the copy to proceed
+                        if (existingInfo == null ||
+                            (existingInfo.size == 0L && size > 0) ||
+                            (size > 0 && existingInfo.size != size)) {
+                            try { reader.delete(filePath) } catch (_: Exception) {}
                         } else {
                             counter.increment()
                             onProgress("Skipping ${counter.progressString()}: $name (exists)")
@@ -592,7 +754,6 @@ class CopyService : Service() {
                     }
                     if (shouldCopy) {
                         if (size > LARGE_FILE_THRESHOLD) {
-                            // Large files will be streamed directly
                             largeFiles.add(LargeFileInfo(docId, name, newFolderPath, size))
                         } else {
                             smallFiles.add(Triple(docId, name, size))
@@ -757,11 +918,12 @@ class CopyService : Service() {
                     val filePath = if (newFolderPath == "/") "/$name" else "$newFolderPath/$name"
                     var shouldCopy = true
                     if (reader.exists(filePath)) {
-                        // Check if existing file is 0 bytes - if so, delete it and copy the new file
+                        // Check if existing file is 0 bytes or size-mismatched — if so, delete and re-copy
                         val existingInfo = reader.getFileInfo(filePath).getOrNull()
-                        if (existingInfo != null && existingInfo.size == 0L && size > 0) {
-                            reader.delete(filePath)
-                            // Don't skip - allow the copy to proceed
+                        if (existingInfo == null ||
+                            (existingInfo.size == 0L && size > 0) ||
+                            (size > 0 && existingInfo.size != size)) {
+                            try { reader.delete(filePath) } catch (_: Exception) {}
                         } else {
                             counter.increment()
                             onProgress("Skipping ${counter.progressString()}: $name (exists)")
