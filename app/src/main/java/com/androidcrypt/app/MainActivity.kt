@@ -60,6 +60,8 @@ import java.io.File
 import java.io.ByteArrayInputStream
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
+private const val DEBUG_LOGGING = false
+
 class MainActivity : ComponentActivity() {
     
     private val requestPermissionLauncher = registerForActivityResult(
@@ -140,7 +142,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         // Unmount all volumes when app is closed
         VolumeMountManager.unmountAll()
-        Log.d("MainActivity", "All volumes unmounted on app close")
+        if (DEBUG_LOGGING) Log.d("MainActivity", "All volumes unmounted on app close")
     }
 }
 
@@ -1510,7 +1512,7 @@ fun FileManagerScreen() {
                         statusColor = Color(0xFF4CAF50)
                     }
                 } catch (e: Exception) {
-                    Log.e("FileManager", "Failed to export file", e)
+                    if (DEBUG_LOGGING) Log.e("FileManager", "Failed to export file", e)
                     statusMessage = "✗ Export failed: ${e.message}"
                     statusColor = Color.Red
                 } finally {
@@ -1550,7 +1552,7 @@ fun FileManagerScreen() {
                         statusColor = Color(0xFF4CAF50)
                     }
                 } catch (e: Exception) {
-                    Log.e("FileManager", "Failed to export folder", e)
+                    if (DEBUG_LOGGING) Log.e("FileManager", "Failed to export folder", e)
                     statusMessage = "✗ Export failed: ${e.message}"
                     statusColor = Color.Red
                 } finally {
@@ -1674,7 +1676,7 @@ fun FileManagerScreen() {
                             usedSpace = totalSpace - freeSpace
                         }
                     } catch (e: Exception) {
-                        Log.e("FileManager", "Failed to get volume stats", e)
+                        if (DEBUG_LOGGING) Log.e("FileManager", "Failed to get volume stats", e)
                     }
                 }
             }
@@ -1934,7 +1936,7 @@ fun FileManagerScreen() {
                                 statusColor = Color(0xFF2196F3)
                             }
                         } catch (e: Exception) {
-                            Log.e("FileManager", "Failed to open Files app", e)
+                            if (DEBUG_LOGGING) Log.e("FileManager", "Failed to open Files app", e)
                             statusMessage = "Could not open Files app: ${e.message}"
                             statusColor = Color.Red
                         }
@@ -2464,7 +2466,7 @@ private suspend fun copyFolderToVolume(
     // Check if folder already exists, if not create it
     if (!reader.exists(newFolderPath)) {
         reader.createDirectory(targetPath, folderName).getOrThrow()
-        Log.d("FileManager", "Created folder: $newFolderPath")
+        if (DEBUG_LOGGING) Log.d("FileManager", "Created folder: $newFolderPath")
     }
     
     // Get the document URI for the folder - handle both tree and document URIs
@@ -2535,7 +2537,7 @@ private suspend fun copyFolderToVolume(
                         fileChannel.send(PreReadFile(name, newFolderPath, data, size))
                     }
                 } catch (e: Exception) {
-                    Log.e("FileManager", "Failed to pre-read file: $name", e)
+                    if (DEBUG_LOGGING) Log.e("FileManager", "Failed to pre-read file: $name", e)
                 } finally {
                     readSemaphore.release()
                 }
@@ -2589,7 +2591,7 @@ private suspend fun copySubFolder(
     
     if (!reader.exists(newFolderPath)) {
         reader.createDirectory(targetPath, folderName).getOrThrow()
-        Log.d("FileManager", "Created subfolder: $newFolderPath")
+        if (DEBUG_LOGGING) Log.d("FileManager", "Created subfolder: $newFolderPath")
     }
     
     // Collect all files and subdirectories
@@ -2651,7 +2653,7 @@ private suspend fun copySubFolder(
                         fileChannel.send(PreReadFile(name, newFolderPath, data, size))
                     }
                 } catch (e: Exception) {
-                    Log.e("FileManager", "Failed to pre-read file: $name", e)
+                    if (DEBUG_LOGGING) Log.e("FileManager", "Failed to pre-read file: $name", e)
                 } finally {
                     readSemaphore.release()
                 }

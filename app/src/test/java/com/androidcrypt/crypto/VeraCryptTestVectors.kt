@@ -16,17 +16,17 @@ class VeraCryptTestVectors {
      */
     @Test
     fun testXTSAESSimple() {
-        // 128-bit keys (16 bytes each for encryption and tweak, 32 bytes total)
-        val key1 = ByteArray(16) { 0x00 }
-        val key2 = ByteArray(16) { 0x00 }
+        // VeraCrypt AES XTS uses 256-bit keys: 32 bytes encryption + 32 bytes tweak = 64 bytes total
+        val key1 = ByteArray(32) { 0x00 }
+        val key2 = ByteArray(32) { 0x00 }
         
         val dataUnitNo = 0L
         val plaintext = ByteArray(32) { 0x00 }
 
-        // Combine keys for XTS mode (32 bytes total for AES-128)
-        val fullKey = ByteArray(32)
-        System.arraycopy(key1, 0, fullKey, 0, 16)
-        System.arraycopy(key2, 0, fullKey, 16, 16)
+        // Combine keys for XTS mode (64 bytes total for AES-256)
+        val fullKey = ByteArray(64)
+        System.arraycopy(key1, 0, fullKey, 0, 32)
+        System.arraycopy(key2, 0, fullKey, 32, 32)
 
         val xts = XTSMode(fullKey, EncryptionAlgorithm.AES)
         val ciphertext = xts.encrypt(plaintext, dataUnitNo)

@@ -22,6 +22,7 @@ class VolumeForegroundService : Service() {
 
     companion object {
         private const val TAG = "VolumeFgService"
+        private const val DEBUG_LOGGING = false
         private const val NOTIFICATION_ID = 1002
         private const val CHANNEL_ID = "volume_mount_channel"
 
@@ -46,7 +47,7 @@ class VolumeForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "onStartCommand: keeping process alive for mounted volumes")
+        if (DEBUG_LOGGING) Log.d(TAG, "onStartCommand: keeping process alive for mounted volumes")
         startForeground(NOTIFICATION_ID, createNotification())
         return START_STICKY
     }
@@ -55,7 +56,7 @@ class VolumeForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.d(TAG, "Service destroyed — no volumes mounted")
+        if (DEBUG_LOGGING) Log.d(TAG, "Service destroyed \u2014 no volumes mounted")
     }
 
     private fun createNotificationChannel() {

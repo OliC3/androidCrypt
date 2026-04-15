@@ -112,7 +112,7 @@ class VolumeReader(
                 mountFromPath(password, pim, keyfileUris, useHiddenVolume, hiddenVolumeProtectionPassword)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error mounting container", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error mounting container", e)
             unmount()
             Result.failure(e)
         } finally {
@@ -289,7 +289,7 @@ class VolumeReader(
         passwordBytes.fill(0)
         
         if (decryptedHeader == null || matchedAlgorithm == null) {
-            Log.e(TAG, "Header validation failed - no algorithm produced valid magic bytes")
+            if (DEBUG_LOGGING) Log.e(TAG, "Header validation failed - no algorithm produced valid magic bytes")
             return Result.failure(Exception("Invalid password or corrupted header"))
         }
         
@@ -524,7 +524,7 @@ class VolumeReader(
             
             Result.success(data)
         } catch (e: Exception) {
-            Log.e(TAG, "Error reading sectors starting at $startSector", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error reading sectors starting at $startSector", e)
             Result.failure(e)
         }
     }
@@ -599,7 +599,7 @@ class VolumeReader(
             Result.success(Unit)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error writing sector $sectorNumber", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error writing sector $sectorNumber", e)
             Result.failure(e)
         }
     }
@@ -723,7 +723,7 @@ class VolumeReader(
             
             Result.success(Unit)
         } catch (e: Exception) {
-            Log.e(TAG, "Error writing sectors starting at $startSector", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error writing sectors starting at $startSector", e)
             Result.failure(e)
         }
     }
@@ -838,7 +838,7 @@ class VolumeReader(
             
             Result.success(Unit)
         } catch (e: Exception) {
-            Log.e(TAG, "Error writing sectors in-place starting at $startSector", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error writing sectors in-place starting at $startSector", e)
             Result.failure(e)
         }
     }
@@ -912,9 +912,9 @@ class VolumeReader(
             volumeInfo = null
             // Shutdown executor to release threads that may hold references to key material
             encryptionExecutor.shutdownNow()
-            Log.d(TAG, "Volume unmounted")
+            if (DEBUG_LOGGING) Log.d(TAG, "Volume unmounted")
         } catch (e: Exception) {
-            Log.e(TAG, "Error unmounting volume", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error unmounting volume", e)
         }
     }
     
@@ -927,7 +927,7 @@ class VolumeReader(
             val fd = parcelFd?.fileDescriptor ?: return
             Os.fdatasync(fd)
         } catch (e: Exception) {
-            Log.w(TAG, "fdatasync failed", e)
+            if (DEBUG_LOGGING) Log.w(TAG, "fdatasync failed", e)
         }
     }
     

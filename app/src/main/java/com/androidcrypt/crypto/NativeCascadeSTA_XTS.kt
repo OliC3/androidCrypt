@@ -1,7 +1,5 @@
 package com.androidcrypt.crypto
 
-import android.util.Log
-
 /**
  * JNI wrapper for the native XTS cascade (Serpent-Twofish-AES) implementation.
  *
@@ -18,16 +16,14 @@ import android.util.Log
  * [decryptSectors] can be called concurrently from multiple threads.
  */
 object NativeCascadeSTA_XTS {
-    private const val TAG = "NativeCascadeSTA_XTS"
     private var loaded = false
 
     init {
         try {
             System.loadLibrary("xts_aes_native")
             loaded = true
-            Log.i(TAG, "Native cascade STA XTS library loaded")
         } catch (e: UnsatisfiedLinkError) {
-            Log.w(TAG, "Native cascade STA XTS library not available", e)
+            // Native library not available
         }
     }
 

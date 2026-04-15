@@ -1,7 +1,5 @@
 package com.androidcrypt.crypto
 
-import android.util.Log
-
 /**
  * JNI wrapper for the native XTS-AES implementation.
  *
@@ -15,16 +13,14 @@ import android.util.Log
  * synchronisation.
  */
 object NativeXTS {
-    private const val TAG = "NativeXTS"
     private var loaded = false
 
     init {
         try {
             System.loadLibrary("xts_aes_native")
             loaded = true
-            Log.i(TAG, "Native XTS library loaded (hwAES=${hasHardwareAES()})")
         } catch (e: UnsatisfiedLinkError) {
-            Log.w(TAG, "Native XTS library not available – using Java fallback", e)
+            // Native library not available - will use Java fallback
         }
     }
 

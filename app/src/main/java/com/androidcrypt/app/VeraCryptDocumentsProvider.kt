@@ -178,7 +178,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     // so that DocumentsProvider and CopyService share the same instance.
     
     override fun onCreate(): Boolean {
-        Log.d(TAG, "VeraCryptDocumentsProvider created")
+        if (DEBUG_LOGGING) Log.d(TAG, "VeraCryptDocumentsProvider created")
         return true
     }
     
@@ -204,7 +204,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 else -> false
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking child document", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error checking child document", e)
             return false
         }
     }
@@ -245,7 +245,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             return Path(rootId, pathComponents)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error finding document path", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error finding document path", e)
             throw FileNotFoundException("Cannot find document path")
         }
     }
@@ -254,7 +254,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Return all mounted VeraCrypt volumes as roots
      */
     override fun queryRoots(projection: Array<out String>?): Cursor {
-        Log.d(TAG, "queryRoots called")
+        if (DEBUG_LOGGING) Log.d(TAG, "queryRoots called")
         
         val result = MatrixCursor(projection ?: DEFAULT_ROOT_PROJECTION)
         
@@ -297,11 +297,11 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                         if (DEBUG_LOGGING) Log.d(TAG, "Added root: $rootId, available: $availableBytes bytes")
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error processing volume", e)
+                    if (DEBUG_LOGGING) Log.e(TAG, "Error processing volume", e)
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error in queryRoots", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error in queryRoots", e)
         }
         
         return result
@@ -329,7 +329,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             includeFile(result, documentId, fileEntry)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error querying document", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error querying document", e)
             throw FileNotFoundException("Cannot find document")
         }
         
@@ -359,7 +359,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 fileEntry.mimeType ?: getMimeType(fileEntry)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting document type", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error getting document type", e)
             return "application/octet-stream"
         }
     }
@@ -408,7 +408,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             result.setNotificationUri(context?.contentResolver, notifyUri)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error querying child documents", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error querying child documents", e)
             // Return empty cursor on error
         }
         
@@ -458,7 +458,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             )
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error opening document", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error opening document", e)
             throw FileNotFoundException("Cannot open document")
         }
     }
@@ -656,7 +656,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 return copySize
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Error reading file at offset $offset", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Error reading file at offset $offset", e)
                 throw android.system.ErrnoException("onRead", android.system.OsConstants.EIO)
             }
         }
@@ -738,7 +738,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                     if (DEBUG_LOGGING) Log.d(TAG, "openDocumentForWrite: completed writing to $path")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error writing to file", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Error writing to file", e)
             }
         }
         
@@ -784,7 +784,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             return newDocumentId
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error creating document", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error creating document", e)
             throw FileNotFoundException("Cannot create document: ${e.message}")
         }
     }
@@ -819,7 +819,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             if (DEBUG_LOGGING) Log.d(TAG, "Deleted document: $documentId, notified parent: $parentDocumentId")
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error deleting document", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error deleting document", e)
             throw FileNotFoundException("Cannot delete document: ${e.message}")
         }
     }
@@ -863,7 +863,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             
             return newDocId
         } catch (e: Exception) {
-            Log.e(TAG, "Error moving document", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error moving document", e)
             throw FileNotFoundException("Cannot move document: ${e.message}")
         }
     }
@@ -880,7 +880,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             
             // For now, only support copy within the same volume
             if (sourceRootId != targetRootId) {
-                Log.e(TAG, "Cross-volume copy not supported")
+                if (DEBUG_LOGGING) Log.e(TAG, "Cross-volume copy not supported")
                 throw UnsupportedOperationException("Cannot copy across volumes")
             }
             
@@ -899,7 +899,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             }
             
         } catch (e: Exception) {
-            Log.e(TAG, "Error copying document", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error copying document", e)
             throw FileNotFoundException("Cannot copy document: ${e.message}")
         }
     }

@@ -1,7 +1,5 @@
 package com.androidcrypt.crypto
 
-import android.util.Log
-
 /**
  * JNI wrapper for the native XTS-Twofish implementation.
  *
@@ -15,16 +13,14 @@ import android.util.Log
  * synchronisation.
  */
 object NativeTwofishXTS {
-    private const val TAG = "NativeTwofishXTS"
     private var loaded = false
 
     init {
         try {
             System.loadLibrary("xts_aes_native")
             loaded = true
-            Log.i(TAG, "Native Twofish-XTS library loaded")
         } catch (e: UnsatisfiedLinkError) {
-            Log.w(TAG, "Native Twofish-XTS library not available", e)
+            // Native library not available
         }
     }
 

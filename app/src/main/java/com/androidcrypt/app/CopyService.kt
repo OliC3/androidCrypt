@@ -32,6 +32,7 @@ class CopyService : Service() {
     
     companion object {
         private const val TAG = "CopyService"
+        private const val DEBUG_LOGGING = false
         private const val NOTIFICATION_ID = 1001
         private const val CHANNEL_ID = "copy_service_channel"
         
@@ -82,10 +83,10 @@ class CopyService : Service() {
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d(TAG, "onStartCommand: action=${intent?.action}")
+        if (DEBUG_LOGGING) Log.d(TAG, "onStartCommand: action=${intent?.action}")
         when (intent?.action) {
             ACTION_CANCEL -> {
-                Log.d(TAG, "Cancel action received")
+                if (DEBUG_LOGGING) Log.d(TAG, "Cancel action received")
                 cancelCopy()
                 return START_NOT_STICKY
             }
@@ -239,7 +240,7 @@ class CopyService : Service() {
     }
     
     fun cancelCopy() {
-        Log.d(TAG, "cancelCopy() called, copyJob=$copyJob")
+        if (DEBUG_LOGGING) Log.d(TAG, "cancelCopy() called, copyJob=$copyJob")
         val job = copyJob
         copyJob = null
         
@@ -253,7 +254,7 @@ class CopyService : Service() {
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        Log.d(TAG, "cancelCopy() complete")
+        if (DEBUG_LOGGING) Log.d(TAG, "cancelCopy() complete")
     }
     
     private fun completeCopy(success: Boolean, message: String) {
@@ -282,7 +283,7 @@ class CopyService : Service() {
     
     private fun startFileCopy(sourceUri: Uri, volumePath: String) {
         if (_isRunning.value) {
-            Log.w(TAG, "Copy already in progress")
+            if (DEBUG_LOGGING) Log.w(TAG, "Copy already in progress")
             return
         }
         
@@ -298,7 +299,7 @@ class CopyService : Service() {
                 val fileName = getFileNameFromUri(sourceUri)
                 val fileSize = getFileSizeFromUri(sourceUri)
                 
-                Log.d(TAG, "startFileCopy: fileSize=${fileSize / (1024 * 1024)} MB")
+                if (DEBUG_LOGGING) Log.d(TAG, "startFileCopy: fileSize=${fileSize / (1024 * 1024)} MB")
                 
                 updateNotification("Copying: $fileName", 0, 1)
                 
@@ -323,12 +324,12 @@ class CopyService : Service() {
                     reader.writeFileStreaming(filePath, stream, fileSize) { bytesWritten ->
                         val percent = if (fileSize > 0) (bytesWritten * 100 / fileSize).toInt() else 0
                         if (bytesWritten % (50 * 1024 * 1024) < (256 * 1024)) { // Log every ~50MB
-                            Log.d(TAG, "startFileCopy: Progress ${bytesWritten / (1024 * 1024)} MB / ${fileSize / (1024 * 1024)} MB ($percent%)")
+                            if (DEBUG_LOGGING) Log.d(TAG, "startFileCopy: Progress ${bytesWritten / (1024 * 1024)} MB / ${fileSize / (1024 * 1024)} MB ($percent%)")
                         }
                     }.getOrThrow()
                 }
                 
-                Log.d(TAG, "startFileCopy: Streaming write completed")
+                if (DEBUG_LOGGING) Log.d(TAG, "startFileCopy: Streaming write completed")
                 updateNotification("Complete: $fileName", 1, 1)
                 
                 // Notify DocumentsProvider
@@ -339,7 +340,7 @@ class CopyService : Service() {
             } catch (e: CancellationException) {
                 completeCopy(false, "Copy cancelled")
             } catch (e: Exception) {
-                Log.e(TAG, "Copy failed", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Copy failed", e)
                 completeCopy(false, "Copy failed: ${e.message}")
             }
         }
@@ -347,7 +348,7 @@ class CopyService : Service() {
     
     private fun startFolderCopy(sourceUri: Uri, volumePath: String, folderName: String) {
         if (_isRunning.value) {
-            Log.w(TAG, "Copy already in progress")
+            if (DEBUG_LOGGING) Log.w(TAG, "Copy already in progress")
             return
         }
         
@@ -386,7 +387,7 @@ class CopyService : Service() {
             } catch (e: CancellationException) {
                 completeCopy(false, "Copy cancelled")
             } catch (e: Exception) {
-                Log.e(TAG, "Copy failed", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Copy failed", e)
                 completeCopy(false, "Copy failed: ${e.message}")
             }
         }
@@ -396,7 +397,7 @@ class CopyService : Service() {
 
     private fun startFolderCopyFromPath(sourceDir: java.io.File, volumePath: String) {
         if (_isRunning.value) {
-            Log.w(TAG, "Copy already in progress")
+            if (DEBUG_LOGGING) Log.w(TAG, "Copy already in progress")
             return
         }
 
@@ -431,7 +432,7 @@ class CopyService : Service() {
             } catch (e: CancellationException) {
                 completeCopy(false, "Copy cancelled")
             } catch (e: Exception) {
-                Log.e(TAG, "Folder copy from path failed", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Folder copy from path failed", e)
                 completeCopy(false, "Copy failed: ${e.message}")
             }
         }
@@ -507,7 +508,7 @@ class CopyService : Service() {
                             try {
                                 if (reader.exists(filePath)) reader.delete(filePath)
                             } catch (cleanupEx: Exception) {
-                                Log.w(TAG, "Failed to clean up partial entry: ${file.name}", cleanupEx)
+                                if (DEBUG_LOGGING) Log.w(TAG, "Failed to clean up partial entry: ${file.name}", cleanupEx)
                             }
                             throw e  // Re-throw so the outer catch reports the failure
                         }
@@ -515,7 +516,7 @@ class CopyService : Service() {
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to copy file: ${file.name}", e)
+                    if (DEBUG_LOGGING) Log.e(TAG, "Failed to copy file: ${file.name}", e)
                     counter.addFailure(file.name)
                     onProgress("Failed ${file.name}: ${e.message}")
                 } finally {
@@ -544,7 +545,7 @@ class CopyService : Service() {
             val childrenUri = DocumentsContract.buildChildDocumentsUri(authority, rootDocId)
             contentResolver.notifyChange(childrenUri, null)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to notify volume change", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to notify volume change", e)
         }
     }
     
@@ -560,7 +561,7 @@ class CopyService : Service() {
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to query file name from URI", e)
+            if (DEBUG_LOGGING) Log.w(TAG, "Failed to query file name from URI", e)
         }
         return fileName ?: uri.lastPathSegment ?: "unknown"
     }
@@ -577,7 +578,7 @@ class CopyService : Service() {
                 }
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to query file size from URI", e)
+            if (DEBUG_LOGGING) Log.w(TAG, "Failed to query file size from URI", e)
         }
         return size
     }
@@ -862,14 +863,14 @@ class CopyService : Service() {
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to write file $name", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to write file $name", e)
             // Clean up 0-byte file that was created before the write failed
             try {
                 if (reader.exists(newFilePath)) {
                     reader.delete(newFilePath)
                 }
             } catch (cleanupEx: Exception) {
-                Log.w(TAG, "Failed to clean up 0-byte file", cleanupEx)
+                if (DEBUG_LOGGING) Log.w(TAG, "Failed to clean up 0-byte file", cleanupEx)
             }
             throw e
         }
@@ -959,7 +960,7 @@ class CopyService : Service() {
                     throw e // Propagate cancellation (user pressed Cancel)
                 } catch (e: Exception) {
                     // Log failure but don't cancel siblings — other files should continue
-                    Log.e(TAG, "Failed to copy file: ${file.name}", e)
+                    if (DEBUG_LOGGING) Log.e(TAG, "Failed to copy file: ${file.name}", e)
                     counter.addFailure(file.name)
                     onProgress("Failed ${file.name}: ${e.message}")
                 } finally {

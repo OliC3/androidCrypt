@@ -236,7 +236,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                             val freeCount = fsInfoBuf.getInt(488)
                             if (nxtFree in 2..totalClustersComputed && nxtFree != -1) {
                                 lastAllocatedCluster = nxtFree
-                                Log.d(TAG, "FSInfo: nxtFree=$nxtFree, freeCount=$freeCount")
+                                if (DEBUG_LOGGING) Log.d(TAG, "FSInfo: nxtFree=$nxtFree, freeCount=$freeCount")
                             }
                             if (freeCount >= 0 && freeCount != -1) {
                                 cachedFreeClusters = freeCount
@@ -245,10 +245,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                     }
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to read FSInfo sector, will scan from cluster 2", e)
+                if (DEBUG_LOGGING) Log.w(TAG, "Failed to read FSInfo sector, will scan from cluster 2", e)
             }
             
-            Log.d(TAG, "FAT32 initialized: totalClusters=$totalClustersComputed, lastAllocatedCluster=$lastAllocatedCluster")
+            if (DEBUG_LOGGING) Log.d(TAG, "FAT32 initialized: totalClusters=$totalClustersComputed, lastAllocatedCluster=$lastAllocatedCluster")
             
             // Prefetch entire FAT table into cache — turns 60+ seconds of
             // on-demand 16KB reads into a single ~1-2s bulk read.
@@ -257,7 +257,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             Result.success(fsInfo!!)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize FAT32 reader", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to initialize FAT32 reader", e)
             Result.failure(e)
         }
     }
@@ -348,7 +348,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         cachedFreeClusters = freeClusters
         val clusterSize = bs.sectorsPerCluster * SECTOR_SIZE
         cachedFreeSpaceBytes = freeClusters.toLong() * clusterSize
-        Log.d(TAG, "FAT prefetch complete in ${elapsed}ms: " +
+        if (DEBUG_LOGGING) Log.d(TAG, "FAT prefetch complete in ${elapsed}ms: " +
                 "$freeClusters free clusters (${cachedFreeSpaceBytes / 1024 / 1024}MB free), " +
                 "${fatBlockCache.size} cache blocks, $totalFatSectors FAT sectors total")
     }
@@ -391,7 +391,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 Result.success(entries)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to list directory", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to list directory", e)
                 Result.failure(e)
             }
         }
@@ -524,7 +524,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             if (DEBUG_LOGGING) Log.d(TAG, "readDirectoryCluster: cluster=$startCluster clusters=${clusterChain.size} entries=${entries.size}")
 
         } catch (e: Exception) {
-            Log.e(TAG, "Error reading directory cluster $startCluster", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Error reading directory cluster $startCluster", e)
         }
 
         return entries
@@ -635,7 +635,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 if (fileInfo.size == 0L) {
                     return Result.success(ByteArray(0))
                 }
-                Log.e(TAG, "readFile: File has size=${fileInfo.size} but no clusters allocated!")
+                if (DEBUG_LOGGING) Log.e(TAG, "readFile: File has size=${fileInfo.size} but no clusters allocated!")
                 return Result.failure(Exception("File has no clusters allocated but size is ${fileInfo.size}"))
             }
             
@@ -715,7 +715,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             Result.success(fileData)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to read file", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to read file", e)
             Result.failure(e)
         }
     }
@@ -810,7 +810,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             readFileRangeByCluster(fileInfo.firstCluster, fileInfo.size, offset, length)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to read file range at offset $offset, length $length", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to read file range at offset $offset, length $length", e)
             Result.failure(e)
         }
     }
@@ -889,7 +889,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             Result.success(result)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to read file range at offset $offset, length $length", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to read file range at offset $offset, length $length", e)
             Result.failure(e)
         }
     }
@@ -1038,11 +1038,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             if (isBrokenPipe) {
                 if (DEBUG_LOGGING) Log.d(TAG, "Stream closed by reader for: $path (normal for seeking)")
             } else {
-                Log.e(TAG, "Failed to stream file", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to stream file", e)
             }
             Result.failure(e)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to stream file", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to stream file", e)
             Result.failure(e)
         }
     }
@@ -1149,7 +1149,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to get file info with cluster", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to get file info with cluster", e)
             Result.failure(e)
         }
     }
@@ -1272,7 +1272,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             
             if (dirEntryOffset == -1 || foundClusterData == null) {
-                Log.e(TAG, "writeFile: File entry not found after scanning $entriesFound entries, last cluster checked: $currentDirCluster")
+                if (DEBUG_LOGGING) Log.e(TAG, "writeFile: File entry not found after scanning $entriesFound entries, last cluster checked: $currentDirCluster")
                 return@withLock Result.failure(Exception("File entry not found"))
             }
             
@@ -1306,7 +1306,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             Result.success(WriteAllocation(clusters, firstDataSector, clusterSize, bs.sectorsPerCluster))
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to write file (metadata phase)", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to write file (metadata phase)", e)
                 Result.failure(e)
             }
         }
@@ -1365,7 +1365,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             Result.success(Unit)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to write file (data phase)", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to write file (data phase)", e)
             Result.failure(e)
         }
     }
@@ -1504,7 +1504,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 
                 Result.success(WriteAllocation(clusters, firstDataSector, clusterSize, bs.sectorsPerCluster))
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to write file streaming (metadata phase)", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to write file streaming (metadata phase)", e)
                 Result.failure(e)
             }
         }
@@ -1586,7 +1586,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             Result.success(Unit)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to write file streaming (data phase)", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to write file streaming (data phase)", e)
             Result.failure(e)
         }
     }
@@ -1690,7 +1690,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 
                 Result.success(DirEntryInfo(foundClusterData, foundFirstSectorOfCluster, dirEntryOffset, fileFirstCluster))
             } catch (e: Exception) {
-                Log.e(TAG, "writeFileStreamingDynamic: metadata phase failed", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "writeFileStreamingDynamic: metadata phase failed", e)
                 Result.failure(e)
             }
         }
@@ -1822,10 +1822,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             invalidateFreeSpaceCache()
             
-            Log.d(TAG, "writeFileStreamingDynamic: wrote $totalBytesWritten bytes (${allClusters.size} clusters) to $path")
+            if (DEBUG_LOGGING) Log.d(TAG, "writeFileStreamingDynamic: wrote $totalBytesWritten bytes (${allClusters.size} clusters) to $path")
             Result.success(Unit)
         } catch (e: Exception) {
-            Log.e(TAG, "writeFileStreamingDynamic failed", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "writeFileStreamingDynamic failed", e)
             Result.failure(e)
         }
     }
@@ -1915,7 +1915,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             cachedFreeClusters = freeClusters
             return freeClusters
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to count free clusters", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to count free clusters", e)
             return 0
         }
     }
@@ -1945,9 +1945,9 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 try {
                     val freeClusters = countFreeClusters()
                     cachedFreeSpaceBytes = freeClusters.toLong() * clusterSize
-                    Log.d(TAG, "Background free space calculation complete: $cachedFreeSpaceBytes bytes")
+                    if (DEBUG_LOGGING) Log.d(TAG, "Background free space calculation complete: $cachedFreeSpaceBytes bytes")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to calculate free space in background", e)
+                    if (DEBUG_LOGGING) Log.e(TAG, "Failed to calculate free space in background", e)
                 } finally {
                     isFreeSpaceBeingCalculated = false
                 }
@@ -1995,7 +1995,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             // Validate we have enough clusters
             if (count > totalClusters - 1) {
-                Log.e(TAG, "Not enough clusters: need $count, have ${totalClusters - 1}")
+                if (DEBUG_LOGGING) Log.e(TAG, "Not enough clusters: need $count, have ${totalClusters - 1}")
                 return emptyList()
             }
             
@@ -2060,7 +2060,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                         if (fatSectorData == null) {
                             fatSectorData = volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrNull()
                             if (fatSectorData == null) {
-                                Log.e(TAG, "Failed to read FAT sector at offset $fatSectorOffset")
+                                if (DEBUG_LOGGING) Log.e(TAG, "Failed to read FAT sector at offset $fatSectorOffset")
                                 break
                             }
                             fatDataBase = 0
@@ -2102,7 +2102,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             
             if (clusters.size < count) {
-                Log.e(TAG, "Not enough free clusters: found ${clusters.size}, needed $count")
+                if (DEBUG_LOGGING) Log.e(TAG, "Not enough free clusters: found ${clusters.size}, needed $count")
                 return emptyList()
             }
             
@@ -2116,7 +2116,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             return clusters
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to allocate clusters", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to allocate clusters", e)
             return emptyList()
         }
     }
@@ -2147,7 +2147,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             
             volumeReader.writeSector(fsInfoSectorNum.toLong(), fsInfoData).getOrThrow()
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to update FSInfo sector", e)
+            if (DEBUG_LOGGING) Log.w(TAG, "Failed to update FSInfo sector", e)
         }
     }
     
@@ -2262,7 +2262,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             // encrypt+lock+write cycles to ~2-4 batch operations total)
             batchWriteFATSectors(fatUpdates)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to write cluster chain", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to write cluster chain", e)
         }
     }
     
@@ -2351,7 +2351,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             // Batch-write consecutive FAT sectors (same optimization as writeClusterChain)
             batchWriteFATSectors(fatUpdates)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to free clusters", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to free clusters", e)
         }
     }
     
@@ -2361,7 +2361,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
      */
     private fun getNextCluster(cluster: Int): Int {
         return readFATEntry(cluster).getOrElse {
-            Log.e(TAG, "Failed to get next cluster for $cluster", it)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to get next cluster for $cluster", it)
             0x0FFFFFFF // Return EOF on error
         }
     }
@@ -2403,9 +2403,9 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             // Batch write all modified FAT sectors to both FAT copies
             batchWriteFATSectors(fatUpdates)
             
-            Log.d(TAG, "appendClusterToChain: chained $lastCluster -> $newCluster")
+            if (DEBUG_LOGGING) Log.d(TAG, "appendClusterToChain: chained $lastCluster -> $newCluster")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to append cluster to chain", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to append cluster to chain", e)
         }
     }
     
@@ -2509,7 +2509,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             volumeReader.sync()
             Result.success(allocation.destPath)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed direct copy: $sourcePath -> $targetParentPath/$targetName", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed direct copy: $sourcePath -> $targetParentPath/$targetName", e)
             Result.failure(e)
         }
     }
@@ -2598,7 +2598,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 Result.success(newEntry)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to create file", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to create file", e)
                 Result.failure(e)
             }
         }
@@ -2807,7 +2807,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 
                 Result.success(newPath)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to move entry: $sourcePath -> $targetParentPath", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to move entry: $sourcePath -> $targetParentPath", e)
                 Result.failure(e)
             }
         }
@@ -2846,7 +2846,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 Result.success(newEntry)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to create directory", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to create directory", e)
                 Result.failure(e)
             }
         }
@@ -2904,7 +2904,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 Result.success(Unit)
                 
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to delete", e)
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to delete", e)
                 Result.failure(e)
             }
         }
@@ -2953,7 +2953,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             return Result.success(Unit)
             
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to delete recursively", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to delete recursively", e)
             return Result.failure(e)
         }
     }
@@ -3037,7 +3037,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         
         // If no space found, allocate a new cluster for the directory
         if (freeOffset == -1) {
-            Log.d(TAG, "createDirectoryEntry: No space in existing clusters, allocating new cluster for directory")
+            if (DEBUG_LOGGING) Log.d(TAG, "createDirectoryEntry: No space in existing clusters, allocating new cluster for directory")
             val newClusters = allocateClusters(1)
             if (newClusters.isEmpty()) {
                 val freeBytes = getFreeSpaceBytes()
@@ -3049,7 +3049,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             
             val newCluster = newClusters[0]
-            Log.d(TAG, "createDirectoryEntry: Allocated new cluster $newCluster, chaining to $lastCluster")
+            if (DEBUG_LOGGING) Log.d(TAG, "createDirectoryEntry: Allocated new cluster $newCluster, chaining to $lastCluster")
             
             // Chain the new cluster to the last cluster of the directory
             appendClusterToChain(lastCluster, newCluster)
@@ -3244,7 +3244,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
     private fun initializeDirectoryCluster(cluster: Int, parentCluster: Int, fatDate: Int, fatTime: Int) {
         val bs = bootSector ?: throw Exception("File system not initialized")
         
-        Log.d(TAG, "initializeDirectoryCluster: cluster=$cluster, parentCluster=$parentCluster")
+        if (DEBUG_LOGGING) Log.d(TAG, "initializeDirectoryCluster: cluster=$cluster, parentCluster=$parentCluster")
         
         val firstDataSector = bs.reservedSectors + (bs.numberOfFATs * bs.sectorsPerFAT)
         val firstSectorOfCluster = ((cluster - 2).toLong() * bs.sectorsPerCluster) + firstDataSector
@@ -3279,7 +3279,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         System.arraycopy(dotEntry, 0, clusterData, 0, 32)
         System.arraycopy(dotDotEntry, 0, clusterData, 32, 32)
         
-        Log.d(TAG, "initializeDirectoryCluster: dotEntry[0]=0x${dotEntry[0].toInt().and(0xFF).toString(16)}, dotDotEntry[0]=0x${dotDotEntry[0].toInt().and(0xFF).toString(16)}")
+        if (DEBUG_LOGGING) Log.d(TAG, "initializeDirectoryCluster: dotEntry[0]=0x${dotEntry[0].toInt().and(0xFF).toString(16)}, dotDotEntry[0]=0x${dotDotEntry[0].toInt().and(0xFF).toString(16)}")
         
         // Write cluster data in one bulk write
         volumeReader.writeSectors(firstSectorOfCluster, clusterData).getOrThrow()
@@ -3295,7 +3295,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
         }
         
-        Log.d(TAG, "Initialized directory cluster $cluster with . and .. entries")
+        if (DEBUG_LOGGING) Log.d(TAG, "Initialized directory cluster $cluster with . and .. entries")
     }
     
     /**

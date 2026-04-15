@@ -11,6 +11,7 @@ import com.androidcrypt.app.VolumeForegroundService
  */
 object VolumeMountManager {
     private const val TAG = "VolumeMountManager"
+    private const val DEBUG_LOGGING = false
     private const val DOCUMENTS_AUTHORITY = "com.androidcrypt.documents"
     private val mountedVolumes = java.util.concurrent.ConcurrentHashMap<String, VolumeReader>()
     private val fileSystemReaders = mutableMapOf<String, FAT32Reader>()
@@ -224,7 +225,7 @@ object VolumeMountManager {
             val fsReader = FAT32Reader(reader)
             val initResult = fsReader.initialize()
             if (initResult.isFailure) {
-                Log.e(TAG, "Failed to initialize file system reader", initResult.exceptionOrNull())
+                if (DEBUG_LOGGING) Log.e(TAG, "Failed to initialize file system reader", initResult.exceptionOrNull())
                 return null
             }
             fileSystemReaders[volumePath] = fsReader
@@ -315,9 +316,9 @@ object VolumeMountManager {
         try {
             val rootsUri = DocumentsContract.buildRootsUri(DOCUMENTS_AUTHORITY)
             context.contentResolver.notifyChange(rootsUri, null)
-            Log.d(TAG, "Notified DocumentsProvider of roots change")
+            if (DEBUG_LOGGING) Log.d(TAG, "Notified DocumentsProvider of roots change")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to notify DocumentsProvider", e)
+            if (DEBUG_LOGGING) Log.e(TAG, "Failed to notify DocumentsProvider", e)
         }
     }
 }

@@ -19,6 +19,7 @@ class VolumeCreator {
     
     companion object {
         private const val TAG = "VolumeCreator"
+        private const val DEBUG_LOGGING = false
         private const val SECTOR_SIZE = 512
         private const val HEADER_SIZE = 512  // Single header is 512 bytes
         private const val SALT_SIZE = 64
@@ -505,7 +506,7 @@ class VolumeCreator {
                 raf.write(encryptedSector)
             }
             
-            Log.d(TAG, "Progress: ${totalBytes / (1024 * 1024)}MB / ${totalBytes / (1024 * 1024)}MB")
+            if (DEBUG_LOGGING) Log.d(TAG, "Progress: ${totalBytes / (1024 * 1024)}MB / ${totalBytes / (1024 * 1024)}MB")
             } finally {
                 xts.close()
             }
@@ -895,7 +896,7 @@ class VolumeCreator {
             }
             
             xts.close()
-            Log.d(TAG, "Hidden volume FAT32 formatted: $sectorCount sectors, ${hiddenDataAreaSize / (1024*1024)}MB")
+            if (DEBUG_LOGGING) Log.d(TAG, "Hidden volume FAT32 formatted: $sectorCount sectors, ${hiddenDataAreaSize / (1024*1024)}MB")
         }
     }
 }

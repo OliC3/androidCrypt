@@ -120,58 +120,8 @@ class XTSDebug {
         println("Match: ${ciphertext.toHexString() == expected}")
     }
     
-    @Test
-    fun debugMultiplyByAlpha() {
-        println("=== Testing multiplyByAlpha ===")
-        
-        // Start with a simple test: all zeros
-        val tweakZero = ByteArray(16) { 0x00 }
-        println("Test 1 - All zeros:")
-        println("  Before: ${tweakZero.toHexString()}")
-        
-        val xtsClass = Class.forName("com.androidcrypt.crypto.XTSMode")
-        val key = ByteArray(32)
-        val xtsInstance = xtsClass.getConstructor(
-            ByteArray::class.java,
-            Class.forName("com.androidcrypt.crypto.EncryptionAlgorithm")
-        ).newInstance(key, Class.forName("com.androidcrypt.crypto.EncryptionAlgorithm").enumConstants!![0])
-        
-        val multiplyMethod = xtsClass.getDeclaredMethod("multiplyByAlpha", ByteArray::class.java)
-        multiplyMethod.isAccessible = true
-        multiplyMethod.invoke(xtsInstance, tweakZero)
-        
-        println("  After:  ${tweakZero.toHexString()}")
-        println("  Expected: all zeros (0 * 2 = 0)")
-        println()
-        
-        // Test 2: value that will trigger XOR with 0x87
-        val tweakHigh = byteArrayOf(
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80.toByte()  // bit 127 set
-        )
-        println("Test 2 - High bit set (will overflow):")
-        println("  Before: ${tweakHigh.toHexString()}")
-        multiplyMethod.invoke(xtsInstance, tweakHigh)
-        println("  After:  ${tweakHigh.toHexString()}")
-        println("  Expected: 87000000000000000000000000000000 (overflow triggers XOR with 0x87)")
-        println()
-        
-        // Test 3: The actual encrypted tweak from Vector 1
-        val tweak = byteArrayOf(
-            0x66.toByte(), 0xe9.toByte(), 0x4b, 0xd4.toByte(),
-            0xef.toByte(), 0x8a.toByte(), 0x2c, 0x3b,
-            0x88.toByte(), 0x4c, 0xfa.toByte(), 0x59,
-            0xca.toByte(), 0x34, 0x2b, 0x2e
-        )
-        
-        println("Test 3 - Vector 1 encrypted tweak:")
-        println("  Before: ${tweak.toHexString()}")
-        multiplyMethod.invoke(xtsInstance, tweak)
-        println("  After:  ${tweak.toHexString()}")
-        
-        // Calculate what it should be by doing the second block of Vector 1
-        println("\nLet me verify by encrypting the second block of Vector 1...")
-    }
+    // Note: debugMultiplyByAlpha was removed — multiplyByAlpha no longer exists
+    // in XTSMode (tweak arithmetic is now handled in native code).
     
     private fun ByteArray.toHexString(): String {
         return joinToString("") { "%02x".format(it) }
