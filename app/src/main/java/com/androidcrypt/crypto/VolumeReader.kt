@@ -32,9 +32,9 @@ class VolumeReader(
     
     private var volumeFile: RandomAccessFile? = null
     private var parcelFd: ParcelFileDescriptor? = null
-    private var masterKey: ByteArray? = null
+    @Volatile private var masterKey: ByteArray? = null
     private var encryptionAlgorithm: EncryptionAlgorithm = EncryptionAlgorithm.AES
-    private var xtsMode: XTSMode? = null  // Cached XTS instance for performance
+    @Volatile private var xtsMode: XTSMode? = null  // Cached XTS instance for performance
     private var volumeSize: Long = 0
     private var dataAreaOffset: Long = 0
     private var dataAreaSize: Long = 0
@@ -202,15 +202,23 @@ class VolumeReader(
         
         if (DEBUG_LOGGING) Log.d(TAG, "Deriving key from password...")
         
-        // Derive key from password using our custom PBKDF2 (supports byte arrays)
-        val iterations = if (pim > 0) {
-            15000 + (pim * 1000)
-        } else {
-            500000  // Default for normal volumes
-        }
-        
         // Derive max key length needed across all algorithms
         val maxDkLen = EncryptionAlgorithm.entries.maxOf { it.keySize }
+        
+        // Hash algorithms supported by the JCE runtime.
+        // VeraCrypt supports SHA-512, SHA-256, Whirlpool, Blake2s, Streebog —
+        // but Whirlpool, Blake2s, and Streebog require a custom HMAC provider
+        // that is not available in standard Android JCE.  We try every hash
+        // for which javax.crypto.Mac succeeds and skip the rest.
+        val supportedHashes = HashAlgorithm.entries.filter { hash ->
+            try {
+                val hmacName = "Hmac${hash.algorithmName.replace("-", "")}"
+                javax.crypto.Mac.getInstance(hmacName)
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
         
         // VeraCrypt hidden volume layout (from src/Common/Volumes.h):
         //   Normal header:   offset 0
@@ -256,32 +264,37 @@ class VolumeReader(
                 headerOffset + SALT_SIZE + HEADER_SIZE
             )
             
-            // Derive key with this salt
-            val dk = PBKDF2.deriveKey(
-                password = passwordBytes,
-                salt = salt,
-                iterations = iterations,
-                hashAlgorithm = HashAlgorithm.SHA512,
-                dkLen = maxDkLen
-            )
-            
-            // Try each algorithm
-            for (algo in EncryptionAlgorithm.entries) {
-                val algoKey = dk.copyOfRange(0, algo.keySize)
-                val candidate = decryptHeader(encryptedHeaderData, algoKey, algo)
-                if (candidate[0] == 'V'.code.toByte() &&
-                    candidate[1] == 'E'.code.toByte() &&
-                    candidate[2] == 'R'.code.toByte() &&
-                    candidate[3] == 'A'.code.toByte()) {
-                    decryptedHeader = candidate
-                    matchedAlgorithm = algo
-                    isHiddenVolume = hidden
-                    algoKey.fill(0)
-                    break
+            // Try each hash algorithm × each encryption algorithm (VeraCrypt tries all combinations)
+            for (hash in supportedHashes) {
+                val iterations = hash.getIterationCount(pim)
+                val dk = PBKDF2.deriveKey(
+                    password = passwordBytes,
+                    salt = salt,
+                    iterations = iterations,
+                    hashAlgorithm = hash,
+                    dkLen = maxDkLen
+                )
+                
+                // Try each encryption algorithm with this derived key
+                for (algo in EncryptionAlgorithm.entries) {
+                    val algoKey = dk.copyOfRange(0, algo.keySize)
+                    val candidate = decryptHeader(encryptedHeaderData, algoKey, algo)
+                    if (candidate[0] == 'V'.code.toByte() &&
+                        candidate[1] == 'E'.code.toByte() &&
+                        candidate[2] == 'R'.code.toByte() &&
+                        candidate[3] == 'A'.code.toByte()) {
+                        decryptedHeader = candidate
+                        matchedAlgorithm = algo
+                        isHiddenVolume = hidden
+                        algoKey.fill(0)
+                        dk.fill(0)
+                        break
+                    }
+                    algoKey.fill(0)  // Zero failed attempt key
                 }
-                algoKey.fill(0)  // Zero failed attempt key
+                if (decryptedHeader != null) { dk.fill(0); break }
+                dk.fill(0)  // Zero derived key after trying all algorithms
             }
-            dk.fill(0)  // Zero derived key after trying all algorithms
             if (decryptedHeader != null) break
         }
         
@@ -311,6 +324,12 @@ class VolumeReader(
         // Cache XTS mode instance and algorithm for performance
         encryptionAlgorithm = matchedAlgorithm
         xtsMode = XTSMode(masterKey!!, encryptionAlgorithm)
+        
+        // L-2: Zero master key immediately — the key material is now in the native
+        // key schedules inside XTSMode.  Keeping the raw bytes on the JVM heap
+        // increases exposure to GC relocation and memory dumps.
+        masterKey!!.fill(0)
+        masterKey = null
         
         if (DEBUG_LOGGING) Log.d(TAG, "Volume info - Data offset: $dataAreaOffset, size: $dataAreaSize, " +
                 "sector: $sectorSize, hidden: $isHiddenVolume, hiddenSize: $hiddenVolumeSize")
@@ -363,39 +382,50 @@ class VolumeReader(
             hiddenHeaderOffset + SALT_SIZE + HEADER_SIZE
         )
         
-        val iterations = if (pim > 0) 15000 + (pim * 1000) else 500000
         val maxDkLen = EncryptionAlgorithm.entries.maxOf { it.keySize }
         val passwordBytes = charArrayToUtf8Bytes(hiddenPassword)
         
-        val dk = PBKDF2.deriveKey(
-            password = passwordBytes,
-            salt = salt,
-            iterations = iterations,
-            hashAlgorithm = HashAlgorithm.SHA512,
-            dkLen = maxDkLen
-        )
+        // Try all supported hash algorithms (same approach as finishMount)
+        val supportedHashes = HashAlgorithm.entries.filter { hash ->
+            try {
+                javax.crypto.Mac.getInstance("Hmac${hash.algorithmName.replace("-", "")}")
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
         
         try {
-            for (algo in EncryptionAlgorithm.entries) {
-                val algoKey = dk.copyOfRange(0, algo.keySize)
-                val candidate = decryptHeader(encryptedData, algoKey, algo)
-                if (candidate[0] == 'V'.code.toByte() &&
-                    candidate[1] == 'E'.code.toByte() &&
-                    candidate[2] == 'R'.code.toByte() &&
-                    candidate[3] == 'A'.code.toByte()) {
-                    // Successfully decrypted hidden header — extract its data area size
-                    val protectedSize = readLong(candidate, 52)  // EncryptedAreaLength of hidden volume
-                    candidate.fill(0)
+            for (hash in supportedHashes) {
+                val iterations = hash.getIterationCount(pim)
+                val dk = PBKDF2.deriveKey(
+                    password = passwordBytes,
+                    salt = salt,
+                    iterations = iterations,
+                    hashAlgorithm = hash,
+                    dkLen = maxDkLen
+                )
+                
+                for (algo in EncryptionAlgorithm.entries) {
+                    val algoKey = dk.copyOfRange(0, algo.keySize)
+                    val candidate = decryptHeader(encryptedData, algoKey, algo)
+                    if (candidate[0] == 'V'.code.toByte() &&
+                        candidate[1] == 'E'.code.toByte() &&
+                        candidate[2] == 'R'.code.toByte() &&
+                        candidate[3] == 'A'.code.toByte()) {
+                        val protectedSize = readLong(candidate, 52)
+                        candidate.fill(0)
+                        algoKey.fill(0)
+                        dk.fill(0)
+                        return protectedSize
+                    }
                     algoKey.fill(0)
-                    return protectedSize
                 }
-                algoKey.fill(0)
+                dk.fill(0)
             }
             return 0
         } finally {
-            // Always zero sensitive material
             passwordBytes.fill(0)
-            dk.fill(0)
         }
     }
     
@@ -426,7 +456,12 @@ class VolumeReader(
      */
     fun readSectors(startSector: Long, count: Int): Result<ByteArray> {
         return try {
-            if (masterKey == null || xtsMode == null) {
+            // Capture volatile xtsMode into a local val — if unmount() races and
+            // nulls the field, we either see null (bail) or a valid reference
+            // that will remain usable for the duration of this call because
+            // unmount() holds ioWriteLock and we hold ioReadLock during I/O.
+            val xts = xtsMode
+            if (xts == null) {
                 return Result.failure(Exception("Volume not mounted"))
             }
             
@@ -493,7 +528,7 @@ class VolumeReader(
                     
                     encryptionExecutor.execute {
                         try {
-                            xtsMode!!.decryptBatchThreadSafe(
+                            xts.decryptBatchThreadSafe(
                                 data,
                                 baseTweakSector + startIdx,
                                 SECTOR_SIZE,
@@ -511,7 +546,7 @@ class VolumeReader(
                 latch.await()
             } else {
                 // Sequential decryption for small reads (1-31 sectors) — avoids thread pool overhead
-                xtsMode!!.decryptBatchThreadSafe(
+                xts.decryptBatchThreadSafe(
                     data,
                     baseTweakSector,
                     SECTOR_SIZE,
@@ -535,7 +570,8 @@ class VolumeReader(
      */
     fun writeSector(sectorNumber: Long, data: ByteArray): Result<Unit> {
         return try {
-            if (masterKey == null) {
+            val xts = xtsMode
+            if (xts == null) {
                 return Result.failure(Exception("Volume not mounted"))
             }
             
@@ -567,7 +603,7 @@ class VolumeReader(
             // Encrypt using XTS mode OUTSIDE the lock (thread-safe version)
             // XTS sector number is absolute from start of volume, not relative to data area
             val xtsSectorNumber = (dataAreaOffset / SECTOR_SIZE) + sectorNumber
-            val encryptedSector = xtsMode!!.encryptSectorThreadSafe(data, xtsSectorNumber)
+            val encryptedSector = xts.encryptSectorThreadSafe(data, xtsSectorNumber)
             
             // Write encrypted sector - writeLock for exclusive I/O
             ioWriteLock.lock()
@@ -618,7 +654,8 @@ class VolumeReader(
                 return Result.failure(Exception("Data size must be a multiple of $SECTOR_SIZE"))
             }
             
-            if (masterKey == null || xtsMode == null) {
+            val xts = xtsMode
+            if (xts == null) {
                 return Result.failure(Exception("Volume not mounted"))
             }
             
@@ -667,7 +704,7 @@ class VolumeReader(
                     
                     encryptionExecutor.execute {
                         try {
-                            xtsMode!!.encryptBatchThreadSafe(
+                            xts.encryptBatchThreadSafe(
                                 encryptedData,
                                 baseTweakSector + startIdx,
                                 SECTOR_SIZE,
@@ -685,7 +722,7 @@ class VolumeReader(
                 latch.await()
             } else {
                 // Sequential batch encryption for small writes (1-31 sectors)
-                xtsMode!!.encryptBatchThreadSafe(
+                xts.encryptBatchThreadSafe(
                     encryptedData,
                     baseTweakSector,
                     SECTOR_SIZE,
@@ -744,7 +781,8 @@ class VolumeReader(
                 return Result.failure(Exception("Data length must be a multiple of $SECTOR_SIZE"))
             }
             
-            if (masterKey == null || xtsMode == null) {
+            val xts = xtsMode
+            if (xts == null) {
                 return Result.failure(Exception("Volume not mounted"))
             }
             
@@ -785,7 +823,7 @@ class VolumeReader(
                     
                     encryptionExecutor.execute {
                         try {
-                            xtsMode!!.encryptBatchThreadSafe(
+                            xts.encryptBatchThreadSafe(
                                 data,
                                 baseTweakSector + startIdx,
                                 SECTOR_SIZE,
@@ -801,7 +839,7 @@ class VolumeReader(
                 
                 latch.await()
             } else {
-                xtsMode!!.encryptBatchThreadSafe(
+                xts.encryptBatchThreadSafe(
                     data,
                     baseTweakSector,
                     SECTOR_SIZE,
@@ -901,16 +939,30 @@ class VolumeReader(
      */
     fun unmount() {
         try {
+            // Take exclusive write lock to ensure no readSectors/writeSector calls
+            // are in flight — prevents use-after-free on the native XTS context.
+            ioWriteLock.lock()
+            try {
+                // Capture and null the references under the lock so concurrent
+                // readers see null and bail out with "Volume not mounted".
+                val mk = masterKey
+                masterKey = null
+                val xts = xtsMode
+                xtsMode = null
+                volumeInfo = null
+                
+                mk?.fill(0)  // Securely zero master key
+                xts?.close()  // Release native XTS context (zeros key schedules)
+            } finally {
+                ioWriteLock.unlock()
+            }
+            
+            // Close file handles and shutdown executor outside the lock
+            // (these are not accessed by readSectors/writeSector paths)
             volumeFile?.close()
             volumeFile = null
             parcelFd?.close()
             parcelFd = null
-            masterKey?.fill(0)  // Securely zero master key before releasing
-            masterKey = null
-            xtsMode?.close()  // Release native XTS context (zeros key schedules)
-            xtsMode = null
-            volumeInfo = null
-            // Shutdown executor to release threads that may hold references to key material
             encryptionExecutor.shutdownNow()
             if (DEBUG_LOGGING) Log.d(TAG, "Volume unmounted")
         } catch (e: Exception) {

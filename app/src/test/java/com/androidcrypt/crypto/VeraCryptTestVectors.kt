@@ -31,9 +31,16 @@ class VeraCryptTestVectors {
         val xts = XTSMode(fullKey, EncryptionAlgorithm.AES)
         val ciphertext = xts.encrypt(plaintext, dataUnitNo)
 
-        // Just verify encrypt/decrypt round-trip works
+        // Ciphertext must differ from plaintext (encryption actually did something)
+        assertFalse("Ciphertext should differ from plaintext", ciphertext.contentEquals(plaintext))
+
+        // Verify round-trip
         val decrypted = xts.decrypt(ciphertext, dataUnitNo)
         assertArrayEquals(plaintext, decrypted)
+
+        // Verify deterministic: encrypting same plaintext again yields same ciphertext
+        val ciphertext2 = xts.encrypt(ByteArray(32) { 0x00 }, dataUnitNo)
+        assertArrayEquals("Encryption must be deterministic", ciphertext, ciphertext2)
     }
     
     /**
@@ -144,5 +151,116 @@ class VeraCryptTestVectors {
 
         val decrypted = xts.decrypt(ciphertext, dataUnitNo)
         assertArrayEquals(plaintext, decrypted)
+    }
+
+    // ── XTS additional coverage ─────────────────────────────────────────────
+
+    @Test
+    fun testXTS_differentDataUnitNumbers_produceDifferentCiphertexts() {
+        val key = ByteArray(64) { (it * 3 + 7).toByte() }
+        val xts = XTSMode(key, EncryptionAlgorithm.AES)
+        val plaintext = ByteArray(512) { 0x42 }
+
+        val ct0 = xts.encrypt(plaintext, 0)
+        val ct1 = xts.encrypt(plaintext, 1)
+        val ct100 = xts.encrypt(plaintext, 100)
+
+        assertFalse("Sector 0 vs 1 should differ", ct0.contentEquals(ct1))
+        assertFalse("Sector 0 vs 100 should differ", ct0.contentEquals(ct100))
+        assertFalse("Sector 1 vs 100 should differ", ct1.contentEquals(ct100))
+
+        // Each should still decrypt correctly
+        assertArrayEquals(plaintext, xts.decrypt(ct0, 0))
+        assertArrayEquals(plaintext, xts.decrypt(ct1, 1))
+        assertArrayEquals(plaintext, xts.decrypt(ct100, 100))
+    }
+
+    @Test
+    fun testXTS_threadSafe_matchesNormal() {
+        val key = ByteArray(64) { (it * 5 + 11).toByte() }
+        val xts = XTSMode(key, EncryptionAlgorithm.AES)
+        val plaintext = ByteArray(512) { (it % 256).toByte() }
+
+        val normal = xts.encrypt(plaintext, 42)
+        val threadSafe = xts.encryptSectorThreadSafe(plaintext, 42)
+        assertArrayEquals("Thread-safe encrypt should match normal", normal, threadSafe)
+
+        val decNormal = xts.decrypt(normal, 42)
+        val decThreadSafe = xts.decryptSectorThreadSafe(normal, 42)
+        assertArrayEquals("Thread-safe decrypt should match normal", decNormal, decThreadSafe)
+    }
+
+    @Test
+    fun testXTS_batchEncryptDecrypt_matchesIndividual() {
+        val key = ByteArray(64) { (it * 13 + 2).toByte() }
+        val xts = XTSMode(key, EncryptionAlgorithm.AES)
+        val sectorSize = 512
+        val sectorCount = 4
+        val plaintext = ByteArray(sectorSize * sectorCount) { (it % 256).toByte() }
+
+        // Encrypt individually
+        val individualCt = ByteArray(plaintext.size)
+        for (i in 0 until sectorCount) {
+            val sector = plaintext.copyOfRange(i * sectorSize, (i + 1) * sectorSize)
+            val ct = xts.encrypt(sector, i.toLong())
+            System.arraycopy(ct, 0, individualCt, i * sectorSize, sectorSize)
+        }
+
+        // Encrypt as batch
+        val batchCt = ByteArray(plaintext.size)
+        xts.encryptBatchThreadSafe(plaintext, 0L, sectorSize, batchCt, 0, sectorCount)
+
+        assertArrayEquals("Batch encrypt should match individual", individualCt, batchCt)
+
+        // Decrypt as batch
+        val batchPt = ByteArray(plaintext.size)
+        xts.decryptBatchThreadSafe(batchCt, 0L, sectorSize, batchPt, 0, sectorCount)
+        assertArrayEquals("Batch decrypt should recover plaintext", plaintext, batchPt)
+    }
+
+    @Test
+    fun testXTS_encryptDecrypt_withStartOffset() {
+        val key = ByteArray(64) { (it + 1).toByte() }
+        val xts = XTSMode(key, EncryptionAlgorithm.AES)
+        val plaintext = ByteArray(32) { 0xAA.toByte() }
+
+        val ct0 = xts.encrypt(plaintext, 5, startOffset = 0)
+        val ct16 = xts.encrypt(plaintext, 5, startOffset = 16)
+
+        // Round-trip with each startOffset must recover the original plaintext
+        assertArrayEquals(plaintext, xts.decrypt(ct0, 5, startOffset = 0))
+        assertArrayEquals(plaintext, xts.decrypt(ct16, 5, startOffset = 16))
+    }
+
+    @Test
+    fun testXTS_close_and_key_zeroing() {
+        val key = ByteArray(64) { (it + 1).toByte() }
+        val xts = XTSMode(key, EncryptionAlgorithm.AES)
+        val plaintext = ByteArray(32) { 0x55 }
+
+        // Should work before close
+        val ct = xts.encrypt(plaintext, 0)
+        assertFalse(ct.contentEquals(plaintext))
+
+        // Close should not throw
+        xts.close()
+        // Double close should not throw
+        xts.close()
+
+        // Verify key material was zeroed via reflection
+        val key1Field = XTSMode::class.java.getDeclaredField("key1")
+        key1Field.isAccessible = true
+        val key1After = key1Field.get(xts) as ByteArray
+        assertTrue("key1 should be zeroed after close", key1After.all { it == 0.toByte() })
+
+        val key2Field = XTSMode::class.java.getDeclaredField("key2")
+        key2Field.isAccessible = true
+        val key2After = key2Field.get(xts) as ByteArray
+        assertTrue("key2 should be zeroed after close", key2After.all { it == 0.toByte() })
+
+        // Verify native handle was released
+        val handleField = XTSMode::class.java.getDeclaredField("nativeHandle")
+        handleField.isAccessible = true
+        assertEquals("nativeHandle should be 0 after close", 0L, handleField.getLong(xts))
     }
 }

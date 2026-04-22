@@ -28,6 +28,11 @@
 #define LOG_TAG "NativeXTS"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR,  LOG_TAG, __VA_ARGS__)
 
+/* Compiler-resistant memory zeroing: the volatile function-pointer prevents
+   the compiler from optimising away the wipe of sensitive data.            */
+static void *(*const volatile secure_zero_ptr)(void*, int, size_t) = memset;
+#define secure_zero(p, n)  secure_zero_ptr((p), 0, (n))
+
 #include "Serpent.h"
 #define SERPENT_KS_WORDS 140   // 140 x uint32 = 560-byte key schedule
 
@@ -493,7 +498,7 @@ static void EncryptBufferXTS_Portable(XTSContext* ctx, uint8_t* buffer,
         *((uint64_t*)byteBufUnitNo) = dataUnitNo;
     }
 
-    memset(whiteningValue, 0, sizeof(whiteningValue));
+    secure_zero(whiteningValue, sizeof(whiteningValue));
 }
 
 /* --------------- Portable (T-table) XTS decrypt --------------- */
@@ -561,7 +566,7 @@ static void DecryptBufferXTS_Portable(XTSContext* ctx, uint8_t* buffer,
         *((uint64_t*)byteBufUnitNo) = dataUnitNo;
     }
 
-    memset(whiteningValue, 0, sizeof(whiteningValue));
+    secure_zero(whiteningValue, sizeof(whiteningValue));
 }
 
 /* --------------- ARM64 hw-accelerated XTS encrypt --------------- */
@@ -667,8 +672,8 @@ static void EncryptBufferXTS_HW(XTSContext* ctx, uint8_t* buffer,
         *((uint64_t*)byteBufUnitNo) = dataUnitNo;
     }
 
-    memset(whiteningValue, 0, sizeof(whiteningValue));
-    memset(whiteningValues, 0, sizeof(whiteningValues));
+    secure_zero(whiteningValue, sizeof(whiteningValue));
+    secure_zero(whiteningValues, sizeof(whiteningValues));
 }
 
 /* --------------- ARM64 hw-accelerated XTS decrypt --------------- */
@@ -771,8 +776,8 @@ static void DecryptBufferXTS_HW(XTSContext* ctx, uint8_t* buffer,
         *((uint64_t*)byteBufUnitNo) = dataUnitNo;
     }
 
-    memset(whiteningValue, 0, sizeof(whiteningValue));
-    memset(whiteningValues, 0, sizeof(whiteningValues));
+    secure_zero(whiteningValue, sizeof(whiteningValue));
+    secure_zero(whiteningValues, sizeof(whiteningValues));
 }
 
 #endif // __aarch64__
@@ -845,8 +850,8 @@ Java_com_androidcrypt_crypto_NativeXTS_createContext(
     aes_expand_key(&ctx->data_key, k1, key1Len);
     aes_expand_key(&ctx->tweak_key, k2, key2Len);
 
-    memset(k1, 0, sizeof(k1));
-    memset(k2, 0, sizeof(k2));
+    secure_zero(k1, sizeof(k1));
+    secure_zero(k2, sizeof(k2));
 
     return reinterpret_cast<jlong>(ctx);
 }
@@ -855,7 +860,7 @@ JNIEXPORT void JNICALL
 Java_com_androidcrypt_crypto_NativeXTS_destroyContext(JNIEnv*, jclass, jlong handle) {
     auto* ctx = reinterpret_cast<XTSContext*>(handle);
     if (ctx) {
-        memset(ctx, 0, sizeof(XTSContext));
+        secure_zero(ctx, sizeof(XTSContext));
         delete ctx;
     }
 }
@@ -1005,7 +1010,7 @@ static void EncryptBufferXTS_Serpent(SerpentXTSContext* ctx, uint8_t* buffer,
         *((uint64_t*)byteBufUnitNo) = dataUnitNo;
     }
 
-    memset(whiteningValue, 0, sizeof(whiteningValue));
+    secure_zero(whiteningValue, sizeof(whiteningValue));
 }
 
 /* --------------- Portable XTS-Serpent decrypt --------------- */
@@ -1072,7 +1077,7 @@ static void DecryptBufferXTS_Serpent(SerpentXTSContext* ctx, uint8_t* buffer,
         *((uint64_t*)byteBufUnitNo) = dataUnitNo;
     }
 
-    memset(whiteningValue, 0, sizeof(whiteningValue));
+    secure_zero(whiteningValue, sizeof(whiteningValue));
 }
 
 // ============================================================================
@@ -1088,7 +1093,7 @@ Java_com_androidcrypt_crypto_SerpentJNI_nativeSetKey(
     uint8_t k[32];
     env->GetByteArrayRegion(key, 0, 32, reinterpret_cast<jbyte*>(k));
     serpent_set_key(k, ks);
-    memset(k, 0, sizeof(k));
+    secure_zero(k, sizeof(k));
     return reinterpret_cast<jlong>(ks);
 }
 
@@ -1097,7 +1102,7 @@ Java_com_androidcrypt_crypto_SerpentJNI_nativeDestroyKey(
         JNIEnv*, jclass, jlong handle) {
     auto* ks = reinterpret_cast<uint8_t*>(handle);
     if (ks) {
-        memset(ks, 0, SERPENT_KS_WORDS * 4);
+        secure_zero(ks, SERPENT_KS_WORDS * 4);
         delete[] ks;
     }
 }
@@ -1153,8 +1158,8 @@ Java_com_androidcrypt_crypto_NativeSerpentXTS_createContext(
     serpent_set_key(k1, ctx->data_ks);
     serpent_set_key(k2, ctx->tweak_ks);
 
-    memset(k1, 0, sizeof(k1));
-    memset(k2, 0, sizeof(k2));
+    secure_zero(k1, sizeof(k1));
+    secure_zero(k2, sizeof(k2));
 
     return reinterpret_cast<jlong>(ctx);
 }
@@ -1164,7 +1169,7 @@ Java_com_androidcrypt_crypto_NativeSerpentXTS_destroyContext(
         JNIEnv*, jclass, jlong handle) {
     auto* ctx = reinterpret_cast<SerpentXTSContext*>(handle);
     if (ctx) {
-        memset(ctx, 0, sizeof(SerpentXTSContext));
+        secure_zero(ctx, sizeof(SerpentXTSContext));
         delete ctx;
     }
 }
@@ -1293,7 +1298,7 @@ static void EncryptBufferXTS_Twofish(TwofishXTSContext* ctx, uint8_t* buffer,
         *((uint64_t*)byteBufUnitNo) = dataUnitNo;
     }
 
-    memset(whiteningValue, 0, sizeof(whiteningValue));
+    secure_zero(whiteningValue, sizeof(whiteningValue));
 }
 
 /* --------------- Portable XTS-Twofish decrypt --------------- */
@@ -1354,7 +1359,7 @@ static void DecryptBufferXTS_Twofish(TwofishXTSContext* ctx, uint8_t* buffer,
         *((uint64_t*)byteBufUnitNo) = dataUnitNo;
     }
 
-    memset(whiteningValue, 0, sizeof(whiteningValue));
+    secure_zero(whiteningValue, sizeof(whiteningValue));
 }
 
 // ============================================================================
@@ -1370,7 +1375,7 @@ Java_com_androidcrypt_crypto_TwofishJNI_nativeSetKey(
     uint8_t k[32];
     env->GetByteArrayRegion(key, 0, 32, reinterpret_cast<jbyte*>(k));
     twofish_set_key(inst, (const u4byte*)k);
-    memset(k, 0, sizeof(k));
+    secure_zero(k, sizeof(k));
     return reinterpret_cast<jlong>(inst);
 }
 
@@ -1379,7 +1384,7 @@ Java_com_androidcrypt_crypto_TwofishJNI_nativeDestroyKey(
         JNIEnv*, jclass, jlong handle) {
     auto* inst = reinterpret_cast<TwofishInstance*>(handle);
     if (inst) {
-        memset(inst, 0, sizeof(TwofishInstance));
+        secure_zero(inst, sizeof(TwofishInstance));
         delete inst;
     }
 }
@@ -1432,8 +1437,8 @@ Java_com_androidcrypt_crypto_NativeTwofishXTS_createContext(
     twofish_set_key(&ctx->data_key, (const u4byte*)k1);
     twofish_set_key(&ctx->tweak_key, (const u4byte*)k2);
 
-    memset(k1, 0, sizeof(k1));
-    memset(k2, 0, sizeof(k2));
+    secure_zero(k1, sizeof(k1));
+    secure_zero(k2, sizeof(k2));
 
     return reinterpret_cast<jlong>(ctx);
 }
@@ -1443,7 +1448,7 @@ Java_com_androidcrypt_crypto_NativeTwofishXTS_destroyContext(
         JNIEnv*, jclass, jlong handle) {
     auto* ctx = reinterpret_cast<TwofishXTSContext*>(handle);
     if (ctx) {
-        memset(ctx, 0, sizeof(TwofishXTSContext));
+        secure_zero(ctx, sizeof(TwofishXTSContext));
         delete ctx;
     }
 }
@@ -1600,7 +1605,7 @@ Java_com_androidcrypt_crypto_NativeCascadeXTS_createContext(
 
     auto* ctx = new(std::nothrow) CascadeXTSContext();
     if (!ctx) return 0;
-    memset(ctx, 0, sizeof(CascadeXTSContext));
+    secure_zero(ctx, sizeof(CascadeXTSContext));
 
     ctx->hw_aes = detect_hw_aes();
 
@@ -1618,8 +1623,8 @@ Java_com_androidcrypt_crypto_NativeCascadeXTS_createContext(
     twofish_set_key(&ctx->tf_tweak_key, (const u4byte*)(k2 + 32));
     serpent_set_key(k2 + 64, ctx->sp_tweak_ks);
 
-    memset(k1, 0, sizeof(k1));
-    memset(k2, 0, sizeof(k2));
+    secure_zero(k1, sizeof(k1));
+    secure_zero(k2, sizeof(k2));
 
     return reinterpret_cast<jlong>(ctx);
 }
@@ -1629,7 +1634,7 @@ Java_com_androidcrypt_crypto_NativeCascadeXTS_destroyContext(
         JNIEnv*, jclass, jlong handle) {
     auto* ctx = reinterpret_cast<CascadeXTSContext*>(handle);
     if (ctx) {
-        memset(ctx, 0, sizeof(CascadeXTSContext));
+        secure_zero(ctx, sizeof(CascadeXTSContext));
         delete ctx;
     }
 }
@@ -1773,7 +1778,7 @@ Java_com_androidcrypt_crypto_NativeCascadeSTA_1XTS_createContext(
 
     auto* ctx = new(std::nothrow) CascadeXTSContext();
     if (!ctx) return 0;
-    memset(ctx, 0, sizeof(CascadeXTSContext));
+    secure_zero(ctx, sizeof(CascadeXTSContext));
 
     ctx->hw_aes = detect_hw_aes();
 
@@ -1791,8 +1796,8 @@ Java_com_androidcrypt_crypto_NativeCascadeSTA_1XTS_createContext(
     twofish_set_key(&ctx->tf_tweak_key, (const u4byte*)(k2 + 32));
     aes_expand_key(&ctx->aes_tweak_key, k2 + 64, 32);
 
-    memset(k1, 0, sizeof(k1));
-    memset(k2, 0, sizeof(k2));
+    secure_zero(k1, sizeof(k1));
+    secure_zero(k2, sizeof(k2));
 
     return reinterpret_cast<jlong>(ctx);
 }
@@ -1802,7 +1807,7 @@ Java_com_androidcrypt_crypto_NativeCascadeSTA_1XTS_destroyContext(
         JNIEnv*, jclass, jlong handle) {
     auto* ctx = reinterpret_cast<CascadeXTSContext*>(handle);
     if (ctx) {
-        memset(ctx, 0, sizeof(CascadeXTSContext));
+        secure_zero(ctx, sizeof(CascadeXTSContext));
         delete ctx;
     }
 }

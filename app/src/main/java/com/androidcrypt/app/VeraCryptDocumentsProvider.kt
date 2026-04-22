@@ -1,5 +1,6 @@
 package com.androidcrypt.app
 
+import android.content.ComponentCallbacks2
 import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
@@ -88,33 +89,40 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         // Videos need persistence for looping; thumbnails are short-lived
         
         // Thumbnail cache: small files ending in -t.valv (typically ~30KB)
-        private const val THUMBNAIL_CACHE_MAX_SIZE = 512 * 1024 // 512KB max per thumbnail
+        internal const val THUMBNAIL_CACHE_MAX_SIZE = 512 * 1024 // 512KB max per thumbnail
         private const val THUMBNAIL_CACHE_MAX_ENTRIES = 100 // Many thumbnails
-        private const val THUMBNAIL_CACHE_TTL_MS = 30_000L // 30 second TTL
+        internal const val THUMBNAIL_CACHE_TTL_MS = 30_000L // 30 second TTL
         private val thumbnailCache = object : LinkedHashMap<String, Pair<Long, ByteArray>>(
             THUMBNAIL_CACHE_MAX_ENTRIES, 0.75f, true
         ) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Long, ByteArray>>?): Boolean {
-                return size > THUMBNAIL_CACHE_MAX_ENTRIES
+                val shouldRemove = size > THUMBNAIL_CACHE_MAX_ENTRIES
+                if (shouldRemove) eldest?.value?.second?.fill(0) // Zero evicted decrypted data
+                return shouldRemove
             }
         }
         private val thumbnailCacheLock = Any()
         
         // Video cache: media files ending in -v.valv (typically 500KB-10MB)
-        private const val VIDEO_CACHE_MAX_SIZE = 10 * 1024 * 1024 // 10MB max per video
+        internal const val VIDEO_CACHE_MAX_SIZE = 10 * 1024 * 1024 // 10MB max per video
         private const val VIDEO_CACHE_MAX_ENTRIES = 10 // Fewer but larger videos
-        private const val VIDEO_CACHE_TTL_MS = 120_000L // 2 minute TTL for looping videos
+        internal const val VIDEO_CACHE_TTL_MS = 120_000L // 2 minute TTL for looping videos
         private val videoCache = object : LinkedHashMap<String, Pair<Long, ByteArray>>(
             VIDEO_CACHE_MAX_ENTRIES, 0.75f, true
         ) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Long, ByteArray>>?): Boolean {
-                return size > VIDEO_CACHE_MAX_ENTRIES
+                val shouldRemove = size > VIDEO_CACHE_MAX_ENTRIES
+                if (shouldRemove) eldest?.value?.second?.fill(0) // Zero evicted decrypted data
+                return shouldRemove
             }
         }
         private val videoCacheLock = Any()
         
-        private fun isVideoFile(key: String): Boolean {
-            // Match Valv encrypted videos, paths containing /video, OR actual video extensions
+        internal fun isVideoFile(key: String): Boolean {
+            // Match Valv encrypted videos, paths containing /video, OR actual video/animated extensions
+            // GIFs are included because Glide's GIF decoder seeks randomly through frames,
+            // causing repeated cache misses with the sliding window. Global caching ensures
+            // the entire file is decrypted once and served from memory on every loop.
             // Use ignoreCase to avoid allocating a lowercase copy
             return key.endsWith("-v.valv", ignoreCase = true) || 
                    key.contains("/video", ignoreCase = true) ||
@@ -129,13 +137,19 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                    key.endsWith(".flv", ignoreCase = true)
         }
         
-        private fun isThumbnailFile(key: String): Boolean {
+        internal const val GIF_CACHE_MAX_SIZE = 50L * 1024 * 1024 // 50MB max per GIF
+        
+        internal fun isGifFile(key: String): Boolean {
+            return key.endsWith(".gif", ignoreCase = true)
+        }
+        
+        internal fun isThumbnailFile(key: String): Boolean {
             return key.endsWith("-t.valv", ignoreCase = true)
         }
         
         fun getCachedFile(key: String): ByteArray? {
-            // Check video cache first for video files
-            if (isVideoFile(key)) {
+            // Check video cache for video and GIF files
+            if (isVideoFile(key) || isGifFile(key)) {
                 synchronized(videoCacheLock) {
                     val entry = videoCache[key] ?: return null
                     if (System.currentTimeMillis() - entry.first > VIDEO_CACHE_TTL_MS) {
@@ -164,6 +178,12 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                     videoCache[key] = Pair(System.currentTimeMillis(), data)
                     if (DEBUG_LOGGING) Log.d("VeraCryptProvider", "VIDEO CACHED: $key (${data.size / 1024}KB) - ${videoCache.size} videos in cache")
                 }
+            } else if (isGifFile(key)) {
+                if (data.size > GIF_CACHE_MAX_SIZE) return
+                synchronized(videoCacheLock) {
+                    videoCache[key] = Pair(System.currentTimeMillis(), data)
+                    if (DEBUG_LOGGING) Log.d("VeraCryptProvider", "GIF CACHED: $key (${data.size / 1024}KB) - ${videoCache.size} entries in cache")
+                }
             } else if (isThumbnailFile(key)) {
                 if (data.size > THUMBNAIL_CACHE_MAX_SIZE) return
                 synchronized(thumbnailCacheLock) {
@@ -172,6 +192,18 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             }
             // Other files (non-thumbnail, non-video) are not cached to save memory
         }
+        
+        /** Test hook: clear and zero all cached entries. Used by unit tests for isolation. */
+        internal fun clearAllCachesForTesting() {
+            synchronized(thumbnailCacheLock) {
+                for (entry in thumbnailCache.values) entry.second.fill(0)
+                thumbnailCache.clear()
+            }
+            synchronized(videoCacheLock) {
+                for (entry in videoCache.values) entry.second.fill(0)
+                videoCache.clear()
+            }
+        }
     }
     
     // FAT32Reader caching is now handled centrally by VolumeMountManager
@@ -179,7 +211,31 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     
     override fun onCreate(): Boolean {
         if (DEBUG_LOGGING) Log.d(TAG, "VeraCryptDocumentsProvider created")
+
+        // Register for memory-pressure callbacks so we can wipe decrypted data
+        context?.applicationContext?.registerComponentCallbacks(object : ComponentCallbacks2 {
+            override fun onTrimMemory(level: Int) {
+                if (level >= ComponentCallbacks2.TRIM_MEMORY_COMPLETE) {
+                    zeroAndClearAllCaches()
+                }
+            }
+            override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {}
+            override fun onLowMemory() { zeroAndClearAllCaches() }
+        })
+
         return true
+    }
+
+    /** Zero every cached decrypted buffer and drop all entries. */
+    private fun zeroAndClearAllCaches() {
+        synchronized(thumbnailCacheLock) {
+            for (entry in thumbnailCache.values) entry.second.fill(0)
+            thumbnailCache.clear()
+        }
+        synchronized(videoCacheLock) {
+            for (entry in videoCache.values) entry.second.fill(0)
+            videoCache.clear()
+        }
     }
     
     /**
@@ -479,8 +535,11 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         // Global cache key for this file
         private val globalCacheKey = "$volumePath:$path"
         
-        // Video files (< 10MB) or thumbnails (< 512KB) get cached globally
+        // Video files (< 10MB), GIFs (< 50MB), or thumbnails (< 512KB) get cached globally.
+        // GIFs need global caching because Glide's GIF decoder seeks randomly through
+        // frames, causing repeated cache misses with the forward-only sliding window.
         private val useGlobalCache = (isVideoFile(globalCacheKey) && fileSize <= VIDEO_CACHE_MAX_SIZE) ||
+                                     (isGifFile(globalCacheKey) && fileSize <= GIF_CACHE_MAX_SIZE) ||
                                      (isThumbnailFile(globalCacheKey) && fileSize <= THUMBNAIL_CACHE_MAX_SIZE)
         
         // Local reference to cached data - avoids repeated global cache lookups
@@ -510,6 +569,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             path.endsWith(".mp4", ignoreCase = true) || path.endsWith(".mkv", ignoreCase = true) ||
             path.endsWith(".avi", ignoreCase = true) || path.endsWith(".mov", ignoreCase = true) ||
             path.endsWith(".webm", ignoreCase = true) || path.endsWith(".m4v", ignoreCase = true) ||
+            path.endsWith(".gif", ignoreCase = true) || // Animated GIFs need large cache window
             path.endsWith(".valv", ignoreCase = true) // Valv encrypted video format
         
         // Cache window sizing:

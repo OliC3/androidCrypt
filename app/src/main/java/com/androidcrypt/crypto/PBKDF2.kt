@@ -111,27 +111,38 @@ class VolumeHeaderParser {
         
         // Convert password to bytes once (avoids creating intermediate String)
         val passwordBytes = charArrayToUtf8Bytes(password)
+        // Derive the max key length once per hash algorithm, then try each
+        // encryption algorithm with a prefix of the derived key.  This avoids
+        // redundant PBKDF2 invocations (the expensive part) and mirrors the
+        // approach used by VolumeReader.finishMount().
+        val maxDkLen = EncryptionAlgorithm.entries.maxOf { it.keySize }
         try {
-            // Try all combinations of hash algorithms and encryption algorithms
             for (hashAlg in HashAlgorithm.values()) {
-                for (encAlg in listOf(EncryptionAlgorithm.AES)) { // Start with AES only
-                    try {
-                        val decrypted = tryDecrypt(
-                            encryptedData,
-                            passwordBytes,
-                            salt,
-                            pim,
-                            hashAlg,
-                            encAlg
-                        )
-                        
-                        if (decrypted != null) {
-                            return decrypted
+                try {
+                    val iterations = hashAlg.getIterationCount(pim)
+                    val dk = PBKDF2.deriveKey(passwordBytes, salt, iterations, hashAlg, maxDkLen)
+                    
+                    for (encAlg in EncryptionAlgorithm.entries) {
+                        val algoKey = dk.copyOfRange(0, encAlg.keySize)
+                        val xts = XTSMode(algoKey, encAlg)
+                        try {
+                            val decrypted = xts.decrypt(encryptedData, 0)
+                            val result = validateAndParse(decrypted, encAlg, hashAlg)
+                            if (result != null) {
+                                algoKey.fill(0)
+                                dk.fill(0)
+                                return result
+                            }
+                        } catch (_: Exception) {
+                            // Try next algorithm
+                        } finally {
+                            algoKey.fill(0)
+                            xts.close()
                         }
-                    } catch (e: Exception) {
-                        // Try next combination
-                        continue
                     }
+                    dk.fill(0)
+                } catch (_: Exception) {
+                    continue
                 }
             }
             
@@ -141,6 +152,7 @@ class VolumeHeaderParser {
         }
     }
     
+    @Suppress("unused")
     private fun tryDecrypt(
         encryptedData: ByteArray,
         password: ByteArray,
@@ -149,7 +161,7 @@ class VolumeHeaderParser {
         hashAlg: HashAlgorithm,
         encAlg: EncryptionAlgorithm
     ): VolumeHeaderData? {
-        // Derive key
+        // Legacy method — kept for API compatibility but no longer called by parseHeader
         val iterations = hashAlg.getIterationCount(pim, isSystemEncryption = false)
         val derivedKey = PBKDF2.deriveKey(
             password,

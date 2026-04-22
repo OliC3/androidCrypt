@@ -92,6 +92,43 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
     fun getFileSystemInfo(): FileSystemInfo? = fsInfo
     
     /**
+     * Validate a FAT32 long-filename entry name.
+     * Rejects null chars, reserved device names, forbidden characters, and
+     * names that exceed the LFN 255-character limit.
+     */
+    private fun validateFat32Name(name: String): Result<Unit> {
+        if (name.isEmpty()) return Result.failure(Exception("Name must not be empty"))
+        if (name.length > 255) return Result.failure(Exception("Name exceeds 255 characters"))
+        if (name == "." || name == "..") return Result.failure(Exception("Reserved directory name"))
+
+        // Forbidden characters per FAT/VFAT spec (includes / which covers path traversal)
+        val forbidden = charArrayOf('\u0000', '\\', '/', ':', '*', '?', '"', '<', '>', '|')
+        for (ch in name) {
+            if (ch in forbidden || ch.code in 0..31) {
+                return Result.failure(Exception("Name contains forbidden character: '${if (ch.code < 32) "0x${ch.code.toString(16)}" else ch}'"))
+            }
+        }
+
+        // Trailing dot or space is silently stripped by Windows — reject to avoid confusion
+        if (name.endsWith('.') || name.endsWith(' ')) {
+            return Result.failure(Exception("Name must not end with a dot or space"))
+        }
+
+        // Reserved DOS device names (with or without extension, case-insensitive)
+        val base = name.substringBefore('.').uppercase()
+        val reserved = setOf(
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        )
+        if (base in reserved) {
+            return Result.failure(Exception("'$name' is a reserved device name"))
+        }
+
+        return Result.success(Unit)
+    }
+
+    /**
      * Normalize path for cache keys - FAT32 is case-insensitive
      */
     private fun normalizePath(path: String): String {
@@ -219,7 +256,12 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             if (DEBUG_LOGGING) Log.d(TAG, "File system detected: ${fsInfo?.type}, Label: ${fsInfo?.label}, Cluster size: $clusterSize")
             
             // Compute total clusters for FSInfo validation and logging
-            val totalClustersComputed = ((totalSectors - (reservedSectors + (numberOfFATs.toLong() * sectorsPerFAT))) / sectorsPerCluster).toInt()
+            val rawClusters = (totalSectors - (reservedSectors + (numberOfFATs.toLong() * sectorsPerFAT))) / sectorsPerCluster
+            if (rawClusters < 0 || rawClusters > Int.MAX_VALUE.toLong()) {
+                return Result.failure(Exception(
+                    "Computed cluster count $rawClusters is out of valid range"))
+            }
+            val totalClustersComputed = rawClusters.toInt()
             
             // Read FSInfo sector (sector 1 typically) to get the free cluster hint
             // This avoids scanning the entire FAT from cluster 2 on first allocation
@@ -2570,9 +2612,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 val bs = bootSector ?: return@withLock Result.failure(Exception("File system not initialized"))
                 
                 // Validate name
-                if (name.isEmpty() || name.contains('/')) {
-                    return@withLock Result.failure(Exception("Invalid file name"))
-                }
+                validateFat32Name(name).onFailure { return@withLock Result.failure(it) }
                 
                 // Check if file already exists
                 val fullPath = if (parentPath == "/") "/$name" else "$parentPath/$name"
@@ -2820,9 +2860,7 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 val bs = bootSector ?: return@withLock Result.failure(Exception("File system not initialized"))
                 
                 // Validate name
-                if (name.isEmpty() || name.contains('/')) {
-                    return@withLock Result.failure(Exception("Invalid directory name"))
-                }
+                validateFat32Name(name).onFailure { return@withLock Result.failure(it) }
                 
                 // Check if directory already exists
                 val fullPath = if (parentPath == "/") "/$name" else "$parentPath/$name"

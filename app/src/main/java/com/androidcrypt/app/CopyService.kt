@@ -23,6 +23,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Semaphore
 import java.io.ByteArrayInputStream
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Foreground Service for copying files to/from encrypted volumes.
@@ -671,25 +673,24 @@ class CopyService : Service() {
     // just increases contention without improving throughput.
     private val SMALL_FILE_PARALLELISM = 4
     
-    // Counter class for progress tracking
+    // Counter class for progress tracking (thread-safe for parallel coroutines)
     class CopyCounter(val total: Int) {
-        var current: Int = 0
-            private set
+        private val _current = AtomicInteger(0)
+        val current: Int get() = _current.get()
         
         // Track files that failed so we can report them at the end
-        private val _failedFiles = mutableListOf<String>()
-        val failedFiles: List<String> get() = _failedFiles
+        private val _failedFiles = ConcurrentLinkedQueue<String>()
+        val failedFiles: List<String> get() = _failedFiles.toList()
         
         fun increment() {
-            current++
+            _current.incrementAndGet()
         }
         
-        @Synchronized
         fun addFailure(name: String) {
             _failedFiles.add(name)
         }
         
-        fun progressString(): String = "$current/$total"
+        fun progressString(): String = "${_current.get()}/$total"
     }
     
     private suspend fun copyFolderToVolume(
