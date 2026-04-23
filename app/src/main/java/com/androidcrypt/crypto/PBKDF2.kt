@@ -28,6 +28,13 @@ object PBKDF2 {
         hashAlgorithm: HashAlgorithm,
         dkLen: Int
     ): ByteArray {
+        // SHA-256 / SHA-512 use the standard JCE provider — fast, audited.
+        // Whirlpool / Blake2s / Streebog are not in Android JCE; route them
+        // through the vendored VeraCrypt hash primitives via NativePkcs5.
+        if (NativePkcs5.supports(hashAlgorithm)) {
+            return NativePkcs5.deriveKey(hashAlgorithm, password, salt, iterations, dkLen)
+        }
+
         val hmacAlgorithm = "Hmac${hashAlgorithm.algorithmName.replace("-", "")}"
         val mac = Mac.getInstance(hmacAlgorithm)
         val keySpec = SecretKeySpec(password, hmacAlgorithm)

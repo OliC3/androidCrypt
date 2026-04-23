@@ -46,6 +46,7 @@ import androidx.core.content.ContextCompat
 import com.androidcrypt.crypto.VolumeCreator
 import com.androidcrypt.crypto.VolumeMountManager
 import com.androidcrypt.crypto.EncryptionAlgorithm
+import com.androidcrypt.crypto.HashAlgorithm
 import com.androidcrypt.crypto.MountedVolumeInfo
 import com.androidcrypt.crypto.FAT32Reader
 import com.androidcrypt.crypto.FileEntry
@@ -664,6 +665,8 @@ fun CreateContainerScreen() {
     var useKeyfiles by remember { mutableStateOf(false) }
     var selectedAlgorithm by remember { mutableStateOf(EncryptionAlgorithm.AES) }
     var algorithmDropdownExpanded by remember { mutableStateOf(false) }
+    var selectedHashAlgorithm by remember { mutableStateOf(HashAlgorithm.SHA512) }
+    var hashDropdownExpanded by remember { mutableStateOf(false) }
     
     // Hidden volume state
     var createHiddenVolume by remember { mutableStateOf(false) }
@@ -807,6 +810,42 @@ fun CreateContainerScreen() {
                         onClick = {
                             selectedAlgorithm = algo
                             algorithmDropdownExpanded = false
+                        }
+                    )
+                }
+            }
+        }
+        
+        // Hash algorithm selector — controls the PBKDF2 PRF used to derive the
+        // header-encryption key.  All five VeraCrypt PRFs are wired up:
+        // SHA-512 (default), SHA-256 use the JCE provider; Whirlpool, Blake2s,
+        // and Streebog go through the bundled native PBKDF2 implementation.
+        Box(modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                value = selectedHashAlgorithm.algorithmName,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text("Hash Algorithm (PBKDF2)") },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = !isCreating) { hashDropdownExpanded = true },
+                enabled = false,
+                colors = OutlinedTextFieldDefaults.colors(
+                    disabledTextColor = MaterialTheme.colorScheme.onSurface,
+                    disabledBorderColor = MaterialTheme.colorScheme.outline,
+                    disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            )
+            DropdownMenu(
+                expanded = hashDropdownExpanded,
+                onDismissRequest = { hashDropdownExpanded = false }
+            ) {
+                HashAlgorithm.entries.forEach { hash ->
+                    DropdownMenuItem(
+                        text = { Text(hash.algorithmName) },
+                        onClick = {
+                            selectedHashAlgorithm = hash
+                            hashDropdownExpanded = false
                         }
                     )
                 }
@@ -1050,7 +1089,8 @@ fun CreateContainerScreen() {
                                     pim = pimValue,
                                     keyfileUris = if (useKeyfiles) keyfileUris else emptyList(),
                                     context = context,
-                                    algorithm = selectedAlgorithm
+                                    algorithm = selectedAlgorithm,
+                                    hashAlgorithm = selectedHashAlgorithm
                                 )
                             }
                         } finally {
@@ -1080,7 +1120,8 @@ fun CreateContainerScreen() {
                                         pim = pimValue,
                                         keyfileUris = if (useKeyfiles) keyfileUris else emptyList(),
                                         context = context,
-                                        algorithm = selectedAlgorithm
+                                        algorithm = selectedAlgorithm,
+                                        hashAlgorithm = selectedHashAlgorithm
                                     )
                                 }
                             } finally {
@@ -1150,7 +1191,7 @@ fun CreateContainerScreen() {
                 )
                 Text("Algorithm: ${selectedAlgorithm.algorithmName}", style = MaterialTheme.typography.bodyMedium)
                 Text("Mode: XTS", style = MaterialTheme.typography.bodyMedium)
-                Text("Hash: SHA-512", style = MaterialTheme.typography.bodyMedium)
+                Text("Hash: ${selectedHashAlgorithm.algorithmName}", style = MaterialTheme.typography.bodyMedium)
             }
         }
     }

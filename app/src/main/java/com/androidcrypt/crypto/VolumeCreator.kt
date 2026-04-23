@@ -46,7 +46,8 @@ class VolumeCreator {
             pim: Int = 0,
             keyfileUris: List<Uri> = emptyList(),
             context: Context? = null,
-            algorithm: EncryptionAlgorithm = EncryptionAlgorithm.AES
+            algorithm: EncryptionAlgorithm = EncryptionAlgorithm.AES,
+            hashAlgorithm: HashAlgorithm = HashAlgorithm.SHA512
         ): Result<String> {
             return try {
                 val containerFile = File(containerPath)
@@ -85,19 +86,17 @@ class VolumeCreator {
                     val salt = ByteArray(SALT_SIZE)
                     SecureRandom().nextBytes(salt)
                     
-                    // Derive encryption key from password using PBKDF2-HMAC-SHA512
-                    val iterations = if (pim > 0) {
-                        15000 + (pim * 1000)
-                    } else {
-                        500000  // Default for normal volumes
-                    }
+                    // Derive encryption key from password.  Iteration count comes
+                    // from the selected hash algorithm so that hash + PIM combine
+                    // identically to the desktop VeraCrypt implementation.
+                    val iterations = hashAlgorithm.getIterationCount(pim, isSystemEncryption = false)
                     
                     // Use custom PBKDF2 that accepts byte arrays (required for keyfile support)
                     val derivedKey = PBKDF2.deriveKey(
                         password = passwordBytes,
                         salt = salt,
                         iterations = iterations,
-                        hashAlgorithm = HashAlgorithm.SHA512,
+                        hashAlgorithm = hashAlgorithm,
                         dkLen = algorithm.keySize  // 64 for single ciphers, 192 for AES-Twofish-Serpent
                     )
                     
@@ -566,7 +565,8 @@ class VolumeCreator {
             pim: Int = 0,
             keyfileUris: List<Uri> = emptyList(),
             context: Context? = null,
-            algorithm: EncryptionAlgorithm = EncryptionAlgorithm.AES
+            algorithm: EncryptionAlgorithm = EncryptionAlgorithm.AES,
+            hashAlgorithm: HashAlgorithm = HashAlgorithm.SHA512
         ): Result<String> {
             return try {
                 val containerFile = File(containerPath)
@@ -612,8 +612,8 @@ class VolumeCreator {
                     charArrayToUtf8Bytes(hiddenPassword)
                 }
                 
-                // Derive key from hidden password
-                val iterations = if (pim > 0) 15000 + (pim * 1000) else 500000
+                // Derive key from hidden password using the chosen hash algorithm.
+                val iterations = hashAlgorithm.getIterationCount(pim, isSystemEncryption = false)
                 val salt = ByteArray(SALT_SIZE)
                 SecureRandom().nextBytes(salt)
                 
@@ -621,7 +621,7 @@ class VolumeCreator {
                     password = passwordBytes,
                     salt = salt,
                     iterations = iterations,
-                    hashAlgorithm = HashAlgorithm.SHA512,
+                    hashAlgorithm = hashAlgorithm,
                     dkLen = algorithm.keySize
                 )
                 

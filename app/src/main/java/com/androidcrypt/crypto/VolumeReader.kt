@@ -205,20 +205,12 @@ class VolumeReader(
         // Derive max key length needed across all algorithms
         val maxDkLen = EncryptionAlgorithm.entries.maxOf { it.keySize }
         
-        // Hash algorithms supported by the JCE runtime.
-        // VeraCrypt supports SHA-512, SHA-256, Whirlpool, Blake2s, Streebog —
-        // but Whirlpool, Blake2s, and Streebog require a custom HMAC provider
-        // that is not available in standard Android JCE.  We try every hash
-        // for which javax.crypto.Mac succeeds and skip the rest.
-        val supportedHashes = HashAlgorithm.entries.filter { hash ->
-            try {
-                val hmacName = "Hmac${hash.algorithmName.replace("-", "")}"
-                javax.crypto.Mac.getInstance(hmacName)
-                true
-            } catch (_: Exception) {
-                false
-            }
-        }
+        // Hash algorithms supported by VeraCrypt: SHA-512, SHA-256, Whirlpool,
+        // Blake2s, Streebog.  SHA-256/SHA-512 use the standard Android JCE
+        // provider; the other three are routed through the bundled native
+        // PBKDF2 implementation in NativePkcs5 / pbkdf2_native.cpp.  All five
+        // are now usable at runtime, so we no longer have to filter the list.
+        val supportedHashes = HashAlgorithm.entries
         
         // VeraCrypt hidden volume layout (from src/Common/Volumes.h):
         //   Normal header:   offset 0
@@ -385,15 +377,9 @@ class VolumeReader(
         val maxDkLen = EncryptionAlgorithm.entries.maxOf { it.keySize }
         val passwordBytes = charArrayToUtf8Bytes(hiddenPassword)
         
-        // Try all supported hash algorithms (same approach as finishMount)
-        val supportedHashes = HashAlgorithm.entries.filter { hash ->
-            try {
-                javax.crypto.Mac.getInstance("Hmac${hash.algorithmName.replace("-", "")}")
-                true
-            } catch (_: Exception) {
-                false
-            }
-        }
+        // All five VeraCrypt hash PRFs are usable now (SHA-* via JCE,
+        // Whirlpool/Blake2s/Streebog via native).
+        val supportedHashes = HashAlgorithm.entries
         
         try {
             for (hash in supportedHashes) {

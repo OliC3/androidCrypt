@@ -16,15 +16,21 @@
 /* Adapted for VeraCrypt */
 
 #include <stdlib.h>
-#include <STRING.H>
+#include <string.h>
 
 #include "blake2.h"
 
+#if defined(_MSC_VER)
 #pragma optimize ("tl", on)
-
 #pragma intrinsic(_lrotr)
 #pragma intrinsic( memcpy )
 #pragma intrinsic( memset )
+#else
+/* Portable rotate-right for GCC/Clang (Android NDK, Linux host) */
+#ifndef _lrotr
+#define _lrotr(x, n) (((uint32)(x) >> (n)) | ((uint32)(x) << (32 - (n))))
+#endif
+#endif
 
 static const uint32 blake2s_IV[8] =
 {

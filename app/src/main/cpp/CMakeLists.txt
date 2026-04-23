@@ -6,11 +6,17 @@ project(xts_aes_native LANGUAGES C CXX)
 # xts_aes_native.cpp.
 set(NATIVE_SOURCES
     xts_aes_native.cpp
+    pbkdf2_native.cpp
     Serpent.c
     Twofish.c
     Crypto/Aescrypt.c
     Crypto/Aeskey.c
     Crypto/Aestab.c
+    # Hash primitives for PBKDF2 (Whirlpool / Blake2s / Streebog).
+    # SHA-256 / SHA-512 stay on the Android JCE provider.
+    Crypto/Whirlpool.c
+    Crypto/blake2s.c
+    Crypto/Streebog.c
 )
 
 # Upstream ARMv8 hardware-AES helpers (vaeseq_u8 / vaesdq_u8). Currently
@@ -54,4 +60,11 @@ target_link_options(xts_aes_native PRIVATE "-Wl,--build-id=none")
 target_compile_options(xts_aes_native PRIVATE
     -O3 -DNDEBUG
     -DCRYPTOPP_DISABLE_ASM
+    # Force the vendored Streebog/Whirlpool implementations onto the
+    # portable C path even on x86_64 (which would otherwise pull in
+    # SSE2/SSE4 intrinsics that reference unresolved cpu-feature globals
+    # like g_hasSSE2 / g_hasSSE41 from VeraCrypt's cpu.c).
+    -DCRYPTOPP_DISABLE_SSE2
+    -DCRYPTOPP_DISABLE_SSSE3
+    -DCRYPTOPP_DISABLE_AESNI
 )
