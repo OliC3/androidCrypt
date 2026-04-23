@@ -256,7 +256,13 @@ class VolumeCreator {
             val clusterCount = (sectorCount - reservedSectors) / (sectorsPerCluster + 1)
             val sectorsPerFAT = (clusterCount * 4 + SECTOR_SIZE - 1) / SECTOR_SIZE
             
-            // Generate random volume ID like VeraCrypt
+            // Generate random volume ID like VeraCrypt.
+            // SECURITY: this 4-byte value is written ONLY into the FAT32 boot
+            // sector (offset 67-70), which is itself XTS-encrypted with the
+            // master key before reaching disk.  No plaintext copy is kept on
+            // disk or in any sidecar — the value is unreachable without the
+            // password.  If you ever add code that writes volumeId outside
+            // the encrypted boot sector, you must reconsider this guarantee.
             val volumeId = ByteArray(4)
             java.security.SecureRandom().nextBytes(volumeId)
             
@@ -779,6 +785,9 @@ class VolumeCreator {
             val clusterCount = (sectorCount - reservedSectors) / (sectorsPerCluster + 1)
             val sectorsPerFAT = (clusterCount * 4 + SECTOR_SIZE - 1) / SECTOR_SIZE
             
+            // SECURITY: see normal-volume formatFAT32 above — this volumeId
+            // is written only into the encrypted boot sector and never
+            // reaches plaintext storage.
             val volumeId = ByteArray(4)
             SecureRandom().nextBytes(volumeId)
             

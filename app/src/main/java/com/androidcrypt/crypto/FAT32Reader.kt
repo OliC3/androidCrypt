@@ -1405,6 +1405,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
             }
             invalidateFreeSpaceCache()
             
+            // H-3: flush FAT + dir-entry updates to disk before returning so a
+            // process kill cannot leave the container with one FAT copy newer
+            // than the other (FAT32 has no journaling).
+            volumeReader.sync()
+            
             Result.success(Unit)
         } catch (e: Exception) {
             if (DEBUG_LOGGING) Log.e(TAG, "Failed to write file (data phase)", e)
@@ -2635,6 +2640,9 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 // Invalidate free space cache
                 invalidateFreeSpaceCache()
                 
+                // H-3: persist the new directory entry before returning.
+                volumeReader.sync()
+                
                 Result.success(newEntry)
                 
             } catch (e: Exception) {
@@ -2845,6 +2853,9 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 val newPath = if (targetParentPath == "/") "/$fileName" else "$targetParentPath/$fileName"
                 if (DEBUG_LOGGING) Log.d(TAG, "moveEntry: Moved $sourcePath -> $newPath (O(1) directory entry relocation)")
                 
+                // H-3: persist source-zero + target-write before returning.
+                volumeReader.sync()
+                
                 Result.success(newPath)
             } catch (e: Exception) {
                 if (DEBUG_LOGGING) Log.e(TAG, "Failed to move entry: $sourcePath -> $targetParentPath", e)
@@ -2880,6 +2891,9 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 fileCache[normalizePath(newEntry.path)] = newEntry
                 // Invalidate free space cache
                 invalidateFreeSpaceCache()
+                
+                // H-3: persist FAT + new directory entries before returning.
+                volumeReader.sync()
                 
                 Result.success(newEntry)
                 
@@ -2937,6 +2951,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 }
                 // Invalidate free space cache
                 invalidateFreeSpaceCache()
+                
+                // H-3: persist freed FAT entries + zeroed directory entries
+                // before returning so a crash doesn't leave dangling clusters
+                // marked allocated.
+                volumeReader.sync()
                 
                 if (DEBUG_LOGGING) Log.d(TAG, "delete: Successfully deleted")
                 Result.success(Unit)

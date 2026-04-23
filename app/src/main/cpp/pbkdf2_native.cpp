@@ -216,6 +216,13 @@ Java_com_androidcrypt_crypto_NativePkcs5_pbkdf2(
     std::memset(hmac.outerKey.data(), 0, hmac.outerKey.size());
     std::memset(hmac.hashCtx.data(), 0, hmac.hashCtx.size());
 
+    // GetByteArrayElements may have returned a heap COPY of the password
+    // bytes (typical on ART).  Releasing with JNI_ABORT frees that copy
+    // without zeroing it, leaving the password in native heap until the
+    // allocator overwrites it.  Wipe both buffers explicitly first.
+    if (pwData)   std::memset(pwData,   0, static_cast<size_t>(pwLen));
+    if (saltData) std::memset(saltData, 0, static_cast<size_t>(saltLen));
+
     env->ReleaseByteArrayElements(password, pwData, JNI_ABORT);
     env->ReleaseByteArrayElements(salt, saltData, JNI_ABORT);
 

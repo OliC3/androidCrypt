@@ -298,6 +298,31 @@ class VolumeReader(
             return Result.failure(Exception("Invalid password or corrupted header"))
         }
         
+        // M-2: validate the two CRC32 fields embedded in the decrypted header.
+        // Magic bytes alone are a 32-bit check; an attacker could craft a header
+        // that produces "VERA" by chance for a chosen master-key collision and
+        // get the app to mount with attacker-controlled dataAreaOffset / size /
+        // sector layout (writes would then land at attacker-chosen offsets).
+        // VeraCrypt itself checks both CRCs; matching that behaviour closes
+        // this trial-decryption ambiguity.
+        //
+        // Header CRC at decrypted offset 188 (full-header offset 252) covers
+        // decrypted bytes 0..187 (full-header offsets 64..251).
+        // Key-area CRC at decrypted offset 8 (full-header offset 72) covers
+        // decrypted bytes 192..447 (full-header offsets 256..511 — the master
+        // key data area).
+        val storedHeaderCrc = readInt(decryptedHeader, 188)
+        val computedHeaderCrc = Crc32.calculate(decryptedHeader, 0, 188)
+        val storedKeyAreaCrc = readInt(decryptedHeader, 8)
+        val computedKeyAreaCrc = Crc32.calculate(decryptedHeader, 192, 256)
+        if (storedHeaderCrc != computedHeaderCrc || storedKeyAreaCrc != computedKeyAreaCrc) {
+            if (DEBUG_LOGGING) Log.e(TAG, "Header CRC mismatch: header ${storedHeaderCrc.toUInt().toString(16)} vs ${computedHeaderCrc.toUInt().toString(16)}, keyArea ${storedKeyAreaCrc.toUInt().toString(16)} vs ${computedKeyAreaCrc.toUInt().toString(16)}")
+            // Zero the bogus decrypted bytes before bailing
+            decryptedHeader.fill(0)
+            passwordBytes.fill(0)
+            return Result.failure(Exception("Invalid password or corrupted header"))
+        }
+        
         if (DEBUG_LOGGING) Log.d(TAG, "Header decrypted successfully with ${matchedAlgorithm.algorithmName}" +
                 if (isHiddenVolume) " (hidden volume)" else " (normal volume)")
         
@@ -959,10 +984,16 @@ class VolumeReader(
     /**
      * Flush buffered writes to the underlying storage device.
      * Uses fdatasync to flush data without metadata (faster than fsync).
+     *
+     * H-3: works on both URI mounts (parcelFd) and path mounts (volumeFile).
+     * The previous implementation only flushed parcelFd, so path-based mounts
+     * silently no-op'd \u2014 leaving FAT mirror updates and directory entries in
+     * the kernel page cache.  A process-kill mid-write could then leave the
+     * container in an inconsistent state on next mount.
      */
     fun sync() {
         try {
-            val fd = parcelFd?.fileDescriptor ?: return
+            val fd = parcelFd?.fileDescriptor ?: volumeFile?.fd ?: return
             Os.fdatasync(fd)
         } catch (e: Exception) {
             if (DEBUG_LOGGING) Log.w(TAG, "fdatasync failed", e)

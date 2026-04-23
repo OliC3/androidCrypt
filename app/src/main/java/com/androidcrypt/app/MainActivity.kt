@@ -22,6 +22,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -37,10 +38,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.foundation.text.BasicSecureTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.TextFieldState
+import androidx.compose.foundation.text.input.clearText
+import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.androidcrypt.crypto.VolumeCreator
@@ -90,25 +96,19 @@ class MainActivity : ComponentActivity() {
             WindowManager.LayoutParams.FLAG_SECURE
         )
         
-        // Request storage permission if needed
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Android 11+: MANAGE_EXTERNAL_STORAGE cannot be granted via requestPermissionLauncher.
-            // It requires sending the user to a dedicated Settings screen.  Without it being
-            // granted at runtime, ACTION_OPEN_DOCUMENT_TREE blocks selection of many common
-            // folders (Downloads, DCIM, etc.) with "can't use this folder".
-            if (!Environment.isExternalStorageManager()) {
-                try {
-                    startActivity(
-                        Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                            data = Uri.fromParts("package", packageName, null)
-                        }
-                    )
-                } catch (e: Exception) {
-                    // Fallback for devices that don't support the per-app screen
-                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                }
-            }
-        } else {
+        // SECURITY (H1/L6): we used to auto-redirect the user into the
+        // "All files access" Settings screen on every cold start when
+        // MANAGE_EXTERNAL_STORAGE was not yet granted.  That granted full
+        // shared-storage read/write to the app for the lifetime of the
+        // install — and conditioned the user to silently tap through an
+        // intrusive permission prompt every launch.  We now rely on the
+        // Storage Access Framework (ACTION_OPEN_DOCUMENT / OPEN_DOCUMENT_TREE)
+        // for container files and keyfiles, which works without
+        // MANAGE_EXTERNAL_STORAGE for any user-picked location.  Users who
+        // genuinely want broad-storage browsing can opt in from the Util tab
+        // ("Grant All Files Access" button), which still launches the same
+        // settings screen but only on explicit request.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             if (ContextCompat.checkSelfPermission(
                     this,
                     Manifest.permission.WRITE_EXTERNAL_STORAGE
@@ -201,7 +201,8 @@ fun MainScreen() {
 fun OpenContainerScreen(onNavigateToTab: (Int) -> Unit = {}) {
     var containerUri by remember { mutableStateOf<Uri?>(null) }
     var containerDisplayName by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
+    // C-2: char-buffer-backed password (no String intermediates).
+    val passwordState = rememberTextFieldState()
     var pim by remember { mutableStateOf("") }
     var statusMessage by remember { mutableStateOf("") }
     var statusColor by remember { mutableStateOf(Color.Gray) }
@@ -213,7 +214,7 @@ fun OpenContainerScreen(onNavigateToTab: (Int) -> Unit = {}) {
     var useKeyfiles by remember { mutableStateOf(false) }
     var useHiddenVolume by remember { mutableStateOf(false) }
     var useHiddenVolumeProtection by remember { mutableStateOf(false) }
-    var hiddenVolumeProtectionPassword by remember { mutableStateOf("") }
+    val hiddenProtPasswordState = rememberTextFieldState()
     var hiddenVolumeExpanded by remember { mutableStateOf(false) }
     
     val context = LocalContext.current
@@ -327,17 +328,11 @@ fun OpenContainerScreen(onNavigateToTab: (Int) -> Unit = {}) {
             Text("Browse...")
         }
         
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            label = { Text("Password") },
+        SecurePasswordField(
+            state = passwordState,
+            label = "Password",
             modifier = Modifier.fillMaxWidth(),
-            enabled = !isMounted,
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Password,
-                autoCorrect = false
-            )
+            enabled = !isMounted
         )
         
         OutlinedTextField(
@@ -468,20 +463,12 @@ fun OpenContainerScreen(onNavigateToTab: (Int) -> Unit = {}) {
                 }
                 
                 if (useHiddenVolumeProtection) {
-                    OutlinedTextField(
-                        value = hiddenVolumeProtectionPassword,
-                        onValueChange = { hiddenVolumeProtectionPassword = it },
-                        label = { Text("Hidden Volume Password (for protection)") },
+                    SecurePasswordField(
+                        state = hiddenProtPasswordState,
+                        label = "Hidden Volume Password (for protection)",
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !isMounted,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Password,
-                            autoCorrect = false
-                        ),
-                        supportingText = {
-                            Text("Enter the hidden volume password so the app can locate and protect its data area")
-                        }
+                        supportingText = "Enter the hidden volume password so the app can locate and protect its data area"
                     )
                 }
             }
@@ -497,13 +484,13 @@ fun OpenContainerScreen(onNavigateToTab: (Int) -> Unit = {}) {
                         statusColor = Color.Red
                         return@Button
                     }
-                    if (password.isEmpty() && keyfileUris.isEmpty()) {
+                    if (passwordState.text.isEmpty() && keyfileUris.isEmpty()) {
                         statusMessage = "Please enter password or select keyfiles"
                         statusColor = Color.Red
                         return@Button
                     }
                     
-                    if (useHiddenVolumeProtection && hiddenVolumeProtectionPassword.isEmpty()) {
+                    if (useHiddenVolumeProtection && hiddenProtPasswordState.text.isEmpty()) {
                         statusMessage = "Please enter the hidden volume password for protection"
                         statusColor = Color.Red
                         return@Button
@@ -516,8 +503,9 @@ fun OpenContainerScreen(onNavigateToTab: (Int) -> Unit = {}) {
                     isLoading = true
                     
                     scope.launch {
-                        val passwordChars = password.toCharArray()
-                        val hiddenProtChars = if (useHiddenVolumeProtection) hiddenVolumeProtectionPassword.toCharArray() else null
+                        // C-2: extract chars directly from the secure buffer; never round-trip through String.
+                        val passwordChars = passwordState.toCharArrayCopy()
+                        val hiddenProtChars = if (useHiddenVolumeProtection) hiddenProtPasswordState.toCharArrayCopy() else null
                         val result = try {
                             withContext(Dispatchers.IO) {
                                 val pimValue = pim.toIntOrNull() ?: 0
@@ -541,10 +529,10 @@ fun OpenContainerScreen(onNavigateToTab: (Int) -> Unit = {}) {
                             onSuccess = { info ->
                                 volumeInfo = info
                                 isMounted = true
-                                // Clear password state immediately after successful mount
-                                password = ""
+                                // C-2: zero secure buffers in place after successful mount.
+                                passwordState.clearText()
                                 pim = ""
-                                hiddenVolumeProtectionPassword = ""
+                                hiddenProtPasswordState.clearText()
                                 val volumeType = when {
                                     info.isHiddenVolume -> "🔒 Encrypted volume"
                                     info.outerVolumeProtectedSize > 0 -> "📦 Encrypted volume (write-protected)"
@@ -654,8 +642,9 @@ fun OpenContainerScreen(onNavigateToTab: (Int) -> Unit = {}) {
 @Composable
 fun CreateContainerScreen() {
     var containerPath by remember { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    var confirmPassword by remember { mutableStateOf("") }
+    // C-2: char-buffer-backed passwords (no String intermediates).
+    val passwordState = rememberTextFieldState()
+    val confirmPasswordState = rememberTextFieldState()
     var containerSize by remember { mutableStateOf("10") }
     var pim by remember { mutableStateOf("") }
     var statusMessage by remember { mutableStateOf("") }
@@ -670,8 +659,8 @@ fun CreateContainerScreen() {
     
     // Hidden volume state
     var createHiddenVolume by remember { mutableStateOf(false) }
-    var hiddenVolumePassword by remember { mutableStateOf("") }
-    var confirmHiddenPassword by remember { mutableStateOf("") }
+    val hiddenPasswordState = rememberTextFieldState()
+    val confirmHiddenPasswordState = rememberTextFieldState()
     var hiddenVolumeSize by remember { mutableStateOf("") }
     var hiddenVolumeExpanded by remember { mutableStateOf(false) }
     
@@ -748,31 +737,17 @@ fun CreateContainerScreen() {
             placeholder = { Text("10") }
         )
         
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            label = { Text("Password") },
+        SecurePasswordField(
+            state = passwordState,
+            label = "Password",
             modifier = Modifier.fillMaxWidth(),
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Password,
-                autoCorrect = false
-            ),
-            supportingText = { 
-                Text("Can be empty if using keyfiles") 
-            }
+            supportingText = "Can be empty if using keyfiles"
         )
         
-        OutlinedTextField(
-            value = confirmPassword,
-            onValueChange = { confirmPassword = it },
-            label = { Text("Confirm Password") },
-            modifier = Modifier.fillMaxWidth(),
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(
-                keyboardType = KeyboardType.Password,
-                autoCorrect = false
-            )
+        SecurePasswordField(
+            state = confirmPasswordState,
+            label = "Confirm Password",
+            modifier = Modifier.fillMaxWidth()
         )
         
         OutlinedTextField(
@@ -953,33 +928,19 @@ fun CreateContainerScreen() {
                 }
                 
                 if (createHiddenVolume) {
-                    OutlinedTextField(
-                        value = hiddenVolumePassword,
-                        onValueChange = { hiddenVolumePassword = it },
-                        label = { Text("Hidden Volume Password") },
+                    SecurePasswordField(
+                        state = hiddenPasswordState,
+                        label = "Hidden Volume Password",
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !isCreating,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Password,
-                            autoCorrect = false
-                        ),
-                        supportingText = {
-                            Text("Must be different from the outer volume password")
-                        }
+                        supportingText = "Must be different from the outer volume password"
                     )
                     
-                    OutlinedTextField(
-                        value = confirmHiddenPassword,
-                        onValueChange = { confirmHiddenPassword = it },
-                        label = { Text("Confirm Hidden Password") },
+                    SecurePasswordField(
+                        state = confirmHiddenPasswordState,
+                        label = "Confirm Hidden Password",
                         modifier = Modifier.fillMaxWidth(),
-                        enabled = !isCreating,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Password,
-                            autoCorrect = false
-                        )
+                        enabled = !isCreating
                     )
                     
                     OutlinedTextField(
@@ -1029,11 +990,11 @@ fun CreateContainerScreen() {
         
         Button(
             onClick = {
-                if (confirmPassword.isNotEmpty() && password != confirmPassword) {
+                if (confirmPasswordState.text.isNotEmpty() && !passwordState.contentEqualsState(confirmPasswordState)) {
                     statusMessage = "Error: Passwords do not match!"
                     return@Button
                 }
-                if (password.isEmpty() && keyfileUris.isEmpty()) {
+                if (passwordState.text.isEmpty() && keyfileUris.isEmpty()) {
                     statusMessage = "Error: Password or keyfiles required!"
                     return@Button
                 }
@@ -1046,15 +1007,15 @@ fun CreateContainerScreen() {
                 
                 // Validate hidden volume parameters
                 if (createHiddenVolume) {
-                    if (hiddenVolumePassword.isEmpty()) {
+                    if (hiddenPasswordState.text.isEmpty()) {
                         statusMessage = "Error: Hidden volume password is required!"
                         return@Button
                     }
-                    if (confirmHiddenPassword.isNotEmpty() && hiddenVolumePassword != confirmHiddenPassword) {
+                    if (confirmHiddenPasswordState.text.isNotEmpty() && !hiddenPasswordState.contentEqualsState(confirmHiddenPasswordState)) {
                         statusMessage = "Error: Hidden volume passwords do not match!"
                         return@Button
                     }
-                    if (hiddenVolumePassword == password) {
+                    if (hiddenPasswordState.contentEqualsState(passwordState)) {
                         statusMessage = "Error: Hidden volume password must be different from outer volume password!"
                         return@Button
                     }
@@ -1078,7 +1039,8 @@ fun CreateContainerScreen() {
                 scope.launch {
                     try {
                         // Step 1: Create the outer container
-                        val passwordChars = password.toCharArray()
+                        // C-2: extract chars directly from the secure buffer.
+                        val passwordChars = passwordState.toCharArrayCopy()
                         val result = try {
                             withContext(Dispatchers.IO) {
                                 val pimValue = pim.toIntOrNull() ?: 0
@@ -1107,8 +1069,8 @@ fun CreateContainerScreen() {
                         if (createHiddenVolume) {
                             statusMessage = "Outer container created. Creating hidden volume..."
                             
-                            val outerChars = password.toCharArray()
-                            val hiddenChars = hiddenVolumePassword.toCharArray()
+                            val outerChars = passwordState.toCharArrayCopy()
+                            val hiddenChars = hiddenPasswordState.toCharArrayCopy()
                             val hiddenResult = try {
                                 withContext(Dispatchers.IO) {
                                     val pimValue = pim.toIntOrNull() ?: 0
@@ -1145,7 +1107,7 @@ fun CreateContainerScreen() {
                 }
             },
             modifier = Modifier.fillMaxWidth(),
-            enabled = containerPath.isNotEmpty() && (password.isNotEmpty() || keyfileUris.isNotEmpty()) && !isCreating
+            enabled = containerPath.isNotEmpty() && (passwordState.text.isNotEmpty() || keyfileUris.isNotEmpty()) && !isCreating
         ) {
             if (isCreating) {
                 CircularProgressIndicator(
@@ -3122,4 +3084,95 @@ private fun DeviceFolderPickerDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+}
+
+// =============================================================================
+// C-2: Secure password input
+//
+// Compose's stock OutlinedTextField stores its value as an immutable `String`.
+// Every keystroke creates a NEW String on the JVM heap; the old ones can never
+// be zeroed and remain in memory until garbage-collected (and even then their
+// underlying char[] backing array can persist in a memory dump).
+//
+// `BasicSecureTextField` (Foundation 1.7+) backs its state with a mutable
+// `TextFieldBuffer` (gap buffer of chars), not Strings. `TextFieldState.text`
+// is a live `CharSequence` view of that buffer. `clearText()` overwrites the
+// buffer in place. The only Strings that touch the heap are transient IME
+// deltas, which is the irreducible minimum on Android.
+//
+// `SecurePasswordField` wraps it in a Material3-styled outlined container so
+// the visual language matches the rest of the form.
+// =============================================================================
+
+@Composable
+fun SecurePasswordField(
+    state: TextFieldState,
+    label: String,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    supportingText: String? = null,
+) {
+    Column(modifier = modifier) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (enabled) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+            modifier = Modifier.padding(start = 4.dp, bottom = 4.dp)
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(
+                    width = 1.dp,
+                    color = if (enabled) MaterialTheme.colorScheme.outline
+                            else MaterialTheme.colorScheme.outline.copy(alpha = 0.38f),
+                    shape = RoundedCornerShape(4.dp)
+                )
+                .padding(horizontal = 16.dp, vertical = 16.dp)
+        ) {
+            BasicSecureTextField(
+                state = state,
+                enabled = enabled,
+                textStyle = LocalTextStyle.current.copy(
+                    color = MaterialTheme.colorScheme.onSurface
+                ),
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Password,
+                    autoCorrect = false
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        if (supportingText != null) {
+            Text(
+                text = supportingText,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp, top = 4.dp)
+            )
+        }
+    }
+}
+
+/**
+ * Copy the secure buffer's chars into a fresh CharArray *without* going
+ * through `String`. Caller is responsible for zero-filling the returned
+ * array via `.fill('\u0000')` when finished.
+ */
+fun TextFieldState.toCharArrayCopy(): CharArray {
+    val src: CharSequence = this.text
+    val out = CharArray(src.length)
+    for (i in 0 until src.length) out[i] = src[i]
+    return out
+}
+
+/** Content-based equality between two secure password buffers. */
+fun TextFieldState.contentEqualsState(other: TextFieldState): Boolean {
+    val a: CharSequence = this.text
+    val b: CharSequence = other.text
+    if (a.length != b.length) return false
+    for (i in a.indices) if (a[i] != b[i]) return false
+    return true
 }

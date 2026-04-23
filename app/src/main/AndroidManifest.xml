@@ -13,6 +13,7 @@
     <!-- Foreground service for background file copy -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
@@ -57,12 +58,18 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- Foreground service to keep process alive while volumes are mounted -->
+        <!-- Foreground service to keep process alive while volumes are mounted.
+             Uses specialUse because dataSync is time-limited on Android 15+ and
+             would be force-stopped after ~1h, unmounting volumes unexpectedly. -->
         <service
             android:name="com.androidcrypt.app.VolumeForegroundService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the app process alive while encrypted VeraCrypt volumes are mounted so the DocumentsProvider can serve binder requests from other apps without being frozen." />
+        </service>
     </application>
 
 </manifest>

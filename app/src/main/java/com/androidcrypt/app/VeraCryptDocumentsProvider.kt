@@ -211,6 +211,41 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 videoCache.clear()
             }
         }
+        
+        /**
+         * H-2: purge every decrypted cache entry that belongs to the given
+         * volume.  Called from [VolumeMountManager.unmountVolume] so that the
+         * moment a user unmounts a container, no plaintext bytes from any of
+         * its files survive in heap.  Without this hook the entries linger
+         * until TTL expiry (10 min, refresh-on-hit) or memory pressure.
+         *
+         * Cache keys are formatted as "$volumePath:$path" by
+         * [EncryptedFileProxyCallback.globalCacheKey], so we match by prefix.
+         */
+        @JvmStatic
+        fun invalidateCachesForVolume(volumePath: String) {
+            val prefix = "$volumePath:"
+            synchronized(thumbnailCacheLock) {
+                val it = thumbnailCache.entries.iterator()
+                while (it.hasNext()) {
+                    val e = it.next()
+                    if (e.key.startsWith(prefix)) {
+                        e.value.second.fill(0)
+                        it.remove()
+                    }
+                }
+            }
+            synchronized(videoCacheLock) {
+                val it = videoCache.entries.iterator()
+                while (it.hasNext()) {
+                    val e = it.next()
+                    if (e.key.startsWith(prefix)) {
+                        e.value.second.fill(0)
+                        it.remove()
+                    }
+                }
+            }
+        }
     }
     
     // FAT32Reader caching is now handled centrally by VolumeMountManager

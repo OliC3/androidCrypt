@@ -153,6 +153,16 @@ object VolumeMountManager {
             fsReaderLock.lock()
             try { fileSystemReaders.remove(containerPath) } finally { fsReaderLock.unlock() }
             
+            // H-2: purge any decrypted plaintext for this volume that the
+            // DocumentsProvider may still be holding in its video / GIF /
+            // thumbnail caches.  Without this the caches keep the bytes alive
+            // up to VIDEO_CACHE_TTL_MS (10 min, refresh-on-hit) after the
+            // user has explicitly unmounted.
+            try {
+                com.androidcrypt.app.VeraCryptDocumentsProvider
+                    .invalidateCachesForVolume(containerPath)
+            } catch (_: Throwable) { /* provider may not be loaded in unit tests */ }
+            
             // Notify callbacks
             unmountCallbacks.forEach { it(containerPath) }
             
@@ -180,6 +190,14 @@ object VolumeMountManager {
         // Clear all shared file system readers
         fsReaderLock.lock()
         try { fileSystemReaders.clear() } finally { fsReaderLock.unlock() }
+        
+        // H-2: purge every cached decrypted byte for each unmounted volume.
+        try {
+            for (p in paths) {
+                com.androidcrypt.app.VeraCryptDocumentsProvider
+                    .invalidateCachesForVolume(p)
+            }
+        } catch (_: Throwable) { /* provider may not be loaded in unit tests */ }
         
         // Notify callbacks for each unmounted volume
         paths.forEach { path ->

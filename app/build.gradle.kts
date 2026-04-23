@@ -48,6 +48,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Sign release builds with the debug keystore so they can be
+            // installed directly. Replace with a production signing config
+            // before distributing to users.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     testOptions {
