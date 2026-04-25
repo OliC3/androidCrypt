@@ -85,6 +85,39 @@ class VolumeReader(
         private const val PARALLEL_SECTOR_BATCH = 128
         // Set to false to disable debug logging for better performance
         private const val DEBUG_LOGGING = false
+
+        /**
+         * Static version of [readBackupRegionFromChannel] for unit testing.
+         */
+        internal fun readBackupRegionFromChannel(channel: java.nio.channels.FileChannel, fileSize: Long): ByteArray? {
+            val groupSize = VolumeConstants.VOLUME_HEADER_GROUP_SIZE
+            if (fileSize < groupSize * 2) return null
+            val regionSize = groupSize.toInt()
+            val backupOffset = fileSize - groupSize
+            val backup = ByteArray(regionSize)
+            val buf = ByteBuffer.wrap(backup)
+            channel.position(backupOffset)
+            var read = 0
+            while (read < regionSize) {
+                val r = channel.read(buf)
+                if (r < 0) break
+                read += r
+            }
+            return if (read == regionSize) backup else null
+        }
+
+        /**
+         * Static version of [readBackupRegionFromRaf] for unit testing.
+         */
+        internal fun readBackupRegionFromRaf(raf: RandomAccessFile, fileSize: Long): ByteArray? {
+            val groupSize = VolumeConstants.VOLUME_HEADER_GROUP_SIZE
+            if (fileSize < groupSize * 2) return null
+            val regionSize = groupSize.toInt()
+            val backup = ByteArray(regionSize)
+            raf.seek(fileSize - groupSize)
+            raf.readFully(backup)
+            return backup
+        }
     }
     
     /**
@@ -152,8 +185,17 @@ class VolumeReader(
             read += r
         }
         
+        // Also load the backup-header region (last 128 KB of the file). If the
+        // primary header is corrupted (bad sector, partial overwrite, ransomware
+        // touching the start of the file) the backup must remain a viable
+        // recovery path — that's the entire point of VeraCrypt writing the
+        // header twice (src/Common/Volumes.h, "Backup header"). We always
+        // pre-read it so the trial-decrypt loop in finishMount has a single
+        // contiguous buffer to operate on, matching the primary code path.
+        val backupRegion = readBackupRegionFromChannel(channel, volumeSize)
+        
         // Continue with common mount logic
-        return finishMount(headerBytes, password, pim, keyfileUris, ctx, useHiddenVolume, hiddenVolumeProtectionPassword)
+        return finishMount(headerBytes, backupRegion, password, pim, keyfileUris, ctx, useHiddenVolume, hiddenVolumeProtectionPassword)
     }
     
     private fun mountFromPath(password: CharArray, pim: Int, keyfileUris: List<Uri>,
@@ -176,11 +218,34 @@ class VolumeReader(
         volumeFile?.seek(0)
         volumeFile?.readFully(fullHeader)
         
-        return finishMount(fullHeader, password, pim, keyfileUris, context, useHiddenVolume, hiddenVolumeProtectionPassword)
+        // Also load the backup-header region (last 128 KB of the file) so the
+        // trial-decrypt loop can fall back to it if the primary header is
+        // corrupted. See note in mountFromUri.
+        val backupRegion = readBackupRegionFromRaf(volumeFile!!, volumeSize)
+        
+        return finishMount(fullHeader, backupRegion, password, pim, keyfileUris, context, useHiddenVolume, hiddenVolumeProtectionPassword)
+    }
+    
+    /**
+     * Read the backup-header region (last VOLUME_HEADER_GROUP_SIZE bytes of the
+     * file) via FileChannel. Returns null if the file is too small to host both
+     * a primary and a backup header region without them overlapping.
+     */
+    private fun readBackupRegionFromChannel(channel: java.nio.channels.FileChannel, fileSize: Long): ByteArray? {
+        return Companion.readBackupRegionFromChannel(channel, fileSize)
+    }
+    
+    /**
+     * Read the backup-header region via RandomAccessFile. Returns null if the
+     * file is too small to host both a primary and a backup header region.
+     */
+    private fun readBackupRegionFromRaf(raf: RandomAccessFile, fileSize: Long): ByteArray? {
+        return Companion.readBackupRegionFromRaf(raf, fileSize)
     }
     
     private fun finishMount(
         fullHeader: ByteArray, 
+        backupHeader: ByteArray?,
         password: CharArray, 
         pim: Int,
         keyfileUris: List<Uri>,
@@ -245,49 +310,74 @@ class VolumeReader(
         var matchedAlgorithm: EncryptionAlgorithm? = null
         var isHiddenVolume = false
         
-        for ((headerOffset, hidden) in headerPositions) {
-            // Ensure we have enough data for this header position
-            if (headerOffset + SALT_SIZE + HEADER_SIZE > fullHeader.size) continue
-            
-            // Extract salt and encrypted data at this offset
-            val salt = fullHeader.copyOfRange(headerOffset, headerOffset + SALT_SIZE)
-            val encryptedHeaderData = fullHeader.copyOfRange(
-                headerOffset + SALT_SIZE, 
-                headerOffset + SALT_SIZE + HEADER_SIZE
-            )
-            
-            // Try each hash algorithm × each encryption algorithm (VeraCrypt tries all combinations)
-            for (hash in supportedHashes) {
-                val iterations = hash.getIterationCount(pim)
-                val dk = PBKDF2.deriveKey(
-                    password = passwordBytes,
-                    salt = salt,
-                    iterations = iterations,
-                    hashAlgorithm = hash,
-                    dkLen = maxDkLen
+        // Trial-decrypt loop, factored out so it can be reused for the backup
+        // header region. Returns true if `decryptedHeader` was populated.
+        // Captures: passwordBytes, pim, supportedHashes, maxDkLen,
+        //           decryptedHeader, matchedAlgorithm, isHiddenVolume.
+        fun tryHeaderRegion(region: ByteArray): Boolean {
+            for ((headerOffset, hidden) in headerPositions) {
+                // Ensure we have enough data for this header position
+                if (headerOffset + SALT_SIZE + HEADER_SIZE > region.size) continue
+                
+                // Extract salt and encrypted data at this offset
+                val salt = region.copyOfRange(headerOffset, headerOffset + SALT_SIZE)
+                val encryptedHeaderData = region.copyOfRange(
+                    headerOffset + SALT_SIZE, 
+                    headerOffset + SALT_SIZE + HEADER_SIZE
                 )
                 
-                // Try each encryption algorithm with this derived key
-                for (algo in EncryptionAlgorithm.entries) {
-                    val algoKey = dk.copyOfRange(0, algo.keySize)
-                    val candidate = decryptHeader(encryptedHeaderData, algoKey, algo)
-                    if (candidate[0] == 'V'.code.toByte() &&
-                        candidate[1] == 'E'.code.toByte() &&
-                        candidate[2] == 'R'.code.toByte() &&
-                        candidate[3] == 'A'.code.toByte()) {
-                        decryptedHeader = candidate
-                        matchedAlgorithm = algo
-                        isHiddenVolume = hidden
-                        algoKey.fill(0)
-                        dk.fill(0)
-                        break
+                // Try each hash algorithm × each encryption algorithm (VeraCrypt tries all combinations)
+                for (hash in supportedHashes) {
+                    val iterations = hash.getIterationCount(pim)
+                    val dk = PBKDF2.deriveKey(
+                        password = passwordBytes,
+                        salt = salt,
+                        iterations = iterations,
+                        hashAlgorithm = hash,
+                        dkLen = maxDkLen
+                    )
+                    
+                    // Try each encryption algorithm with this derived key
+                    for (algo in EncryptionAlgorithm.entries) {
+                        val algoKey = dk.copyOfRange(0, algo.keySize)
+                        val candidate = decryptHeader(encryptedHeaderData, algoKey, algo)
+                        if (candidate[0] == 'V'.code.toByte() &&
+                            candidate[1] == 'E'.code.toByte() &&
+                            candidate[2] == 'R'.code.toByte() &&
+                            candidate[3] == 'A'.code.toByte()) {
+                            decryptedHeader = candidate
+                            matchedAlgorithm = algo
+                            isHiddenVolume = hidden
+                            algoKey.fill(0)
+                            dk.fill(0)
+                            break
+                        }
+                        algoKey.fill(0)  // Zero failed attempt key
                     }
-                    algoKey.fill(0)  // Zero failed attempt key
+                    if (decryptedHeader != null) { dk.fill(0); break }
+                    dk.fill(0)  // Zero derived key after trying all algorithms
                 }
-                if (decryptedHeader != null) { dk.fill(0); break }
-                dk.fill(0)  // Zero derived key after trying all algorithms
+                if (decryptedHeader != null) return true
             }
-            if (decryptedHeader != null) break
+            return false
+        }
+        
+        // First try the primary region.
+        tryHeaderRegion(fullHeader)
+        
+        // If the primary header is corrupted (CRC mismatch, partial overwrite,
+        // bad sector), fall back to the backup region. VeraCrypt itself does
+        // exactly this — see TrueCrypt/VeraCrypt source: ReadVolumeHeader()
+        // is called once for the normal header and again with the backup
+        // header if the first call fails. Without this fallback the on-disk
+        // backup header is dead weight.
+        var usedBackupHeader = false
+        if (decryptedHeader == null && backupHeader != null) {
+            if (DEBUG_LOGGING) Log.w(TAG, "Primary header failed; trying backup header region")
+            if (tryHeaderRegion(backupHeader)) {
+                usedBackupHeader = true
+                if (DEBUG_LOGGING) Log.i(TAG, "Mounted from backup header (primary header is unreadable)")
+            }
         }
         
         // Zero password bytes — no longer needed
@@ -356,8 +446,11 @@ class VolumeReader(
         // Then writeSectors/writeSector can refuse writes that would overwrite hidden data.
         var outerVolumeProtectedSize = 0L
         if (!isHiddenVolume && hiddenVolumeProtectionPassword != null) {
+            // If we mounted from the backup region, look up the hidden header
+            // there too — the primary region may be unreadable.
+            val protectionRegion = if (usedBackupHeader && backupHeader != null) backupHeader else fullHeader
             outerVolumeProtectedSize = resolveHiddenVolumeProtection(
-                fullHeader, hiddenVolumeProtectionPassword, pim, ctx
+                protectionRegion, hiddenVolumeProtectionPassword, pim, ctx
             )
             if (outerVolumeProtectedSize > 0) {
                 if (DEBUG_LOGGING) Log.d(TAG, "Hidden volume protection enabled")

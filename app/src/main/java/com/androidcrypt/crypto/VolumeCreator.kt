@@ -104,20 +104,45 @@ class VolumeCreator {
                     val masterKey = ByteArray(algorithm.keySize)
                     SecureRandom().nextBytes(masterKey)
                     
+                    // Generate an INDEPENDENT salt + derived key for the backup header.
+                    // VeraCrypt's on-disk format gives every header its own 64-byte salt
+                    // (src/Common/Volumes.h, src/Volume/VolumeHeader.cpp). Reusing the
+                    // primary salt would: (a) leak that the two header regions belong
+                    // to the same volume even before decryption, and (b) defeat the
+                    // backup's purpose of providing a second independent recovery path
+                    // — a fault in the primary salt bytes would be mirrored exactly in
+                    // the backup. The backup MUST share the master key, otherwise the
+                    // backup would unlock a different (nonexistent) data area.
+                    val backupSalt = ByteArray(SALT_SIZE)
+                    SecureRandom().nextBytes(backupSalt)
+                    val backupDerivedKey = PBKDF2.deriveKey(
+                        password = passwordBytes,
+                        salt = backupSalt,
+                        iterations = iterations,
+                        hashAlgorithm = hashAlgorithm,
+                        dkLen = algorithm.keySize
+                    )
+                    
                     try {
-                        // Create volume header
+                        // Create primary volume header
                         val headerBytes = createVolumeHeader(salt, derivedKey, masterKey, totalBytes, algorithm)
                         
                         // Write primary header at offset 0 (salt + encrypted header = 512 bytes)
                         raf.seek(0)
                         raf.write(headerBytes)
                         
+                        // Build a SEPARATE backup header with its own salt + derived key
+                        // (master key is shared so the data area is recoverable from either).
+                        val backupHeaderBytes = createVolumeHeader(
+                            backupSalt, backupDerivedKey, masterKey, totalBytes, algorithm
+                        )
+                        
                         // Write backup header at end of file - 128KB
                         // VeraCrypt layout: backup header at (dataAreaSize + TC_VOLUME_HEADER_GROUP_SIZE) 
                         // = (totalBytes - 256KB) + 128KB = totalBytes - 128KB
                         val backupHeaderOffset = totalBytes - DATA_AREA_OFFSET
                         raf.seek(backupHeaderOffset)
-                        raf.write(headerBytes)
+                        raf.write(backupHeaderBytes)
                         
                         // Format the data area with FAT32 file system
                         formatFAT32(raf, masterKey, totalBytes, algorithm)
@@ -126,6 +151,7 @@ class VolumeCreator {
                         // Securely zero all key material
                         passwordBytes.fill(0)
                         derivedKey.fill(0)
+                        backupDerivedKey.fill(0)
                         masterKey.fill(0)
                     }
                 }

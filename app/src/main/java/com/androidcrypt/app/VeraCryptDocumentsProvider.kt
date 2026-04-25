@@ -117,6 +117,95 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             }
         }
         private val videoCacheLock = Any()
+
+        /**
+         * Helper: Parse document ID into root ID and path.
+         * Exposed as a static companion method so unit tests can exercise it
+         * without instantiating the full DocumentsProvider.
+         */
+        internal fun parseDocumentId(documentId: String): Pair<String, String> {
+            val rootIdPrefix = "veracrypt_"
+            if (!documentId.startsWith(rootIdPrefix)) {
+                throw IllegalArgumentException("Invalid document ID")
+            }
+            val colonIndex = documentId.indexOf(':', rootIdPrefix.length)
+            if (colonIndex == -1) {
+                throw IllegalArgumentException("Invalid document ID")
+            }
+            val rootId = documentId.substring(0, colonIndex)
+            val path = documentId.substring(colonIndex + 1)
+            if (path.contains('\u0000') ||
+                path.split('/').any { it == ".." } ||
+                path.contains("//")) {
+                throw SecurityException("Invalid path in document ID")
+            }
+            return Pair(rootId, path)
+        }
+
+        /**
+         * Static version of [isChildDocument] for unit testing.
+         */
+        internal fun isChildDocumentStatic(parentDocumentId: String, documentId: String): Boolean {
+            return try {
+                val (parentRootId, parentPath) = parseDocumentId(parentDocumentId)
+                val (docRootId, docPath) = parseDocumentId(documentId)
+                if (parentRootId != docRootId) return false
+                when {
+                    parentPath == "/" -> docPath.startsWith("/") && docPath != "/"
+                    docPath == parentPath -> false
+                    docPath.startsWith("$parentPath/") -> true
+                    else -> false
+                }
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        /**
+         * Static version of [getMimeType] for unit testing.
+         * Uses a manual mapping so tests can run without Android's MimeTypeMap.
+         */
+        internal fun getMimeTypeStatic(fileEntry: FileEntry): String {
+            if (fileEntry.isDirectory) {
+                return DocumentsContract.Document.MIME_TYPE_DIR
+            }
+            val extension = fileEntry.name.substringAfterLast('.', "").lowercase()
+            if (extension.isEmpty()) {
+                return "application/octet-stream"
+            }
+            // Manual mapping for common extensions — avoids Android dependency in tests
+            return when (extension) {
+                "txt" -> "text/plain"
+                "jpg", "jpeg" -> "image/jpeg"
+                "png" -> "image/png"
+                "gif" -> "image/gif"
+                "pdf" -> "application/pdf"
+                "mp4" -> "video/mp4"
+                "mkv" -> "video/x-matroska"
+                "avi" -> "video/x-msvideo"
+                "mov" -> "video/quicktime"
+                "webm" -> "video/webm"
+                "html", "htm" -> "text/html"
+                "css" -> "text/css"
+                "js" -> "application/javascript"
+                "json" -> "application/json"
+                "xml" -> "application/xml"
+                "zip" -> "application/zip"
+                "rar" -> "application/x-rar-compressed"
+                "7z" -> "application/x-7z-compressed"
+                "doc" -> "application/msword"
+                "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                "xls" -> "application/vnd.ms-excel"
+                "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                "ppt" -> "application/vnd.ms-powerpoint"
+                "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                else -> try {
+                    MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+                } catch (_: Exception) {
+                    null
+                } ?: "application/octet-stream"
+            }
+        }
         
         internal fun isVideoFile(key: String): Boolean {
             // Match Valv encrypted videos, paths containing /video, OR actual video/animated extensions
@@ -284,27 +373,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      * Check if a document is a descendant of another
      */
     override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
-        try {
-            // Parse both document IDs
-            val (parentRootId, parentPath) = parseDocumentId(parentDocumentId)
-            val (docRootId, docPath) = parseDocumentId(documentId)
-            
-            // Must be in the same root
-            if (parentRootId != docRootId) {
-                return false
-            }
-            
-            // Check if docPath starts with parentPath
-            return when {
-                parentPath == "/" -> docPath.startsWith("/") && docPath != "/"
-                docPath == parentPath -> false
-                docPath.startsWith("$parentPath/") -> true
-                else -> false
-            }
-        } catch (e: Exception) {
-            if (DEBUG_LOGGING) Log.e(TAG, "Error checking child document", e)
-            return false
-        }
+        return isChildDocumentStatic(parentDocumentId, documentId)
     }
     
     /**
@@ -1117,18 +1186,8 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
     /**
      * Helper: Get MIME type for file
      */
-    private fun getMimeType(fileEntry: FileEntry): String {
-        if (fileEntry.isDirectory) {
-            return DocumentsContract.Document.MIME_TYPE_DIR
-        }
-        
-        val extension = fileEntry.name.substringAfterLast('.', "")
-        if (extension.isEmpty()) {
-            return "application/octet-stream"
-        }
-        
-        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.lowercase())
-            ?: "application/octet-stream"
+    internal fun getMimeType(fileEntry: FileEntry): String {
+        return getMimeTypeStatic(fileEntry)
     }
     
     /**
@@ -1192,35 +1251,6 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
      */
     private fun getDocumentId(rootId: String, path: String): String {
         return "$rootId:$path"
-    }
-    
-    /**
-     * Helper: Parse document ID into root ID and path
-     */
-    private fun parseDocumentId(documentId: String): Pair<String, String> {
-        // Format: "veracrypt_XXXX:/path" - find the FIRST colon after "veracrypt_"
-        val rootIdPrefix = "veracrypt_"
-        if (!documentId.startsWith(rootIdPrefix)) {
-            throw IllegalArgumentException("Invalid document ID")
-        }
-        
-        // Find first colon after the veracrypt_ prefix
-        val colonIndex = documentId.indexOf(':', rootIdPrefix.length)
-        if (colonIndex == -1) {
-            throw IllegalArgumentException("Invalid document ID")
-        }
-        
-        val rootId = documentId.substring(0, colonIndex)
-        val path = documentId.substring(colonIndex + 1)
-        
-        // Path traversal validation: reject null bytes, .. segments, and double slashes
-        if (path.contains('\u0000') ||
-            path.split('/').any { it == ".." } ||
-            path.contains("//")) {
-            throw SecurityException("Invalid path in document ID")
-        }
-        
-        return Pair(rootId, path)
     }
     
     /**
