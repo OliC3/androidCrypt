@@ -301,6 +301,228 @@ class FAT32AdditionalPropertyTests {
         }
     }
 
+    // ── Regression: delete frees clusters when directoryCache is stale ─────
+
+    /**
+     * Regression test for the bug where delete() leaked all data clusters
+     * because getFileInfoWithCluster returned a stale directoryCache entry
+     * with firstCluster=0, causing the `if (firstCluster >= 2)` guard to
+     * skip freeClusters entirely.
+     *
+     * The scenario (matches what happens via SAF when a file picker lists a
+     * directory, a user copies a file in, then deletes it):
+     *   1. createFile     → dir entry on disk has firstCluster=0
+     *   2. listDirectory  → populates directoryCache with that entry
+     *   3. Data is written ON DISK (firstCluster updated), but
+     *      directoryCache still holds the stale firstCluster=0 entry
+     *   4. delete() is called
+     *
+     * Step (3) is reproduced by writing directly via volumeReader so that
+     * no FAT32Reader cache is invalidated — the stale directoryCache
+     * entry from step (2) survives untouched.
+     */
+    @Test
+    fun `delete frees clusters when directory cache holds stale firstCluster`() {
+        val workdir = "/sc_test"
+        fs.createDirectory("/", "sc_test").getOrThrow()
+        try {
+            val name = "s.bin"
+            val path = "$workdir/$name"
+            val clusterBytes = sectorsPerCluster * bytesPerSector
+            val firstDataSector = reservedSectors + numFATs * sectorsPerFAT
+            val fatStart = reservedSectors.toLong()
+
+            val before = scanFreeClusters()
+
+            // Step 1: create the file entry (firstCluster=0 on disk).
+            fs.createFile(workdir, name).getOrThrow()
+
+            // Step 2: list the workdir — directoryCache now holds an entry
+            //         with firstCluster=0.
+            val entries1 = fs.listDirectory(workdir).getOrThrow()
+            val staleEntry = entries1.find { it.name == name }
+            assertTrue("entry must be found after createFile", staleEntry != null)
+            assertEquals(
+                "stale cache entry must have firstCluster=0 before write",
+                0, staleEntry!!.firstCluster
+            )
+
+            // Step 3: allocate ONE cluster ON DISK, going around FAT32Reader
+            // entirely so that directoryCache is never invalidated.
+
+            // 3a. Find a free cluster in FAT sector 0.
+            val fatSector = reader.readSector(fatStart).getOrThrow()
+            val buf = java.nio.ByteBuffer.wrap(fatSector).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            var allocatedCluster = -1
+            for (c in 3..999) {
+                val v = buf.getInt(c * 4) and 0x0FFFFFFF
+                if (v == 0) { allocatedCluster = c; break }
+            }
+            assertTrue("could not find a free cluster", allocatedCluster >= 2)
+
+            // 3b. Write EOF into the FAT for that cluster.
+            buf.putInt(allocatedCluster * 4, 0x0FFFFFFF)
+            reader.writeSector(fatStart, fatSector).getOrThrow()
+
+            // 3c. Walk the workdir cluster chain ON DISK and update the
+            //     file's directory entry with the new firstCluster.
+            val workdirCluster = getClusterOnDisk("/sc_test", reader,
+                fatStart, firstDataSector, sectorsPerCluster.toInt())
+
+            var found = false
+            var wc = workdirCluster
+            val lfnOffsets = intArrayOf(1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
+            while (wc >= 2 && wc < 0x0FFFFFF8 && !found) {
+                val sector = ((wc - 2).toLong() * sectorsPerCluster) + firstDataSector
+                val clusterData = reader.readSectors(sector, sectorsPerCluster.toInt()).getOrThrow()
+                var off = 0
+                var lfnParts = mutableListOf<String>()
+                while (off + 32 <= clusterData.size && !found) {
+                    val fb = clusterData[off].toInt() and 0xFF
+                    if (fb == 0x00) break
+                    if (fb == 0xE5) { lfnParts.clear(); off += 32; continue }
+                    val attr = clusterData[off + 11].toInt() and 0xFF
+                    if (attr == 0x0F) {
+                        val sb = StringBuilder(13)
+                        for (o in lfnOffsets) {
+                            val c1 = clusterData[off + o].toInt() and 0xFF
+                            val c2 = clusterData[off + o + 1].toInt() and 0xFF
+                            val ch = ((c2 shl 8) or c1).toChar()
+                            if (ch == '\u0000' || ch == '\uFFFF') break
+                            sb.append(ch)
+                        }
+                        lfnParts.add(sb.toString())
+                        off += 32; continue
+                    }
+                    val en = if (lfnParts.isNotEmpty()) {
+                        val full = StringBuilder()
+                        for (i in lfnParts.indices.reversed()) full.append(lfnParts[i])
+                        lfnParts.clear()
+                        full.toString()
+                    } else {
+                        val sn = String(clusterData, off, 8, Charsets.US_ASCII).trim()
+                        val ext = String(clusterData, off + 8, 3, Charsets.US_ASCII).trim()
+                        if (ext.isNotEmpty()) "$sn.$ext" else sn
+                    }
+                    if (en == "." || en == "..") { off += 32; continue }
+                    if (en.equals(name, ignoreCase = true)) {
+                        java.nio.ByteBuffer.wrap(clusterData, off + 26, 2)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                            .putShort((allocatedCluster and 0xFFFF).toShort())
+                        java.nio.ByteBuffer.wrap(clusterData, off + 20, 2)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                            .putShort((allocatedCluster shr 16).toShort())
+                        java.nio.ByteBuffer.wrap(clusterData, off + 28, 4)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                            .putInt(clusterBytes)
+                        reader.writeSectors(sector, clusterData).getOrThrow()
+                        reader.sync()
+                        found = true
+                    }
+                    off += 32
+                }
+                val next = java.nio.ByteBuffer.wrap(
+                    reader.readSector(fatStart + (wc * 4 / bytesPerSector)).getOrThrow(),
+                    (wc * 4) % bytesPerSector, 4
+                ).order(java.nio.ByteOrder.LITTLE_ENDIAN).int and 0x0FFFFFFF
+                wc = next
+            }
+            assertTrue("should have found and updated the file entry", found)
+
+            val afterWrite = scanFreeClusters()
+            assertEquals(
+                "should have consumed exactly 1 cluster",
+                1, before - afterWrite
+            )
+
+            // Step 4: delete — must free the cluster even though
+            //         directoryCache is stale.
+            fs.delete(path).getOrThrow()
+
+            val afterDelete = scanFreeClusters()
+            assertEquals(
+                "FAT scan free-count must be restored after delete when " +
+                    "directoryCache holds stale firstCluster=0 " +
+                    "(before=$before afterWrite=$afterWrite afterDelete=$afterDelete)",
+                before, afterDelete
+            )
+        } finally {
+            cleanWorkdir(workdir)
+        }
+    }
+
+    /** Walk the on-disk FAT32 directory tree to find a path's first cluster. */
+    private fun getClusterOnDisk(
+        path: String,
+        reader: VolumeReader,
+        fatStart: Long,
+        firstDataSector: Long,
+        sectorsPerCluster: Int
+    ): Int {
+        // LFN character offsets within a 32-byte entry (Unicode)
+        val lfnOffsets = intArrayOf(1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30)
+        var cluster = 2  // root dir on FAT32
+        for (component in path.trim('/').split('/')) {
+            var found = -1
+            var c = cluster
+            outer@ while (c >= 2 && c < 0x0FFFFFF8 && found < 0) {
+                val sector = ((c - 2).toLong() * sectorsPerCluster) + firstDataSector
+                val data = reader.readSectors(sector, sectorsPerCluster).getOrThrow()
+                var off = 0
+                var lfnParts = mutableListOf<String>()
+                while (off + 32 <= data.size && found < 0) {
+                    val fb = data[off].toInt() and 0xFF
+                    if (fb == 0x00) break
+                    if (fb == 0xE5) { lfnParts.clear(); off += 32; continue }
+                    val attr = data[off + 11].toInt() and 0xFF
+                    if (attr == 0x0F) {
+                        // Collect LFN fragment (reversed order)
+                        val sb = StringBuilder(13)
+                        for (o in lfnOffsets) {
+                            val c1 = data[off + o].toInt() and 0xFF
+                            val c2 = data[off + o + 1].toInt() and 0xFF
+                            val ch = ((c2 shl 8) or c1).toChar()
+                            if (ch == '\u0000' || ch == '\uFFFF') break
+                            sb.append(ch)
+                        }
+                        lfnParts.add(sb.toString())
+                        off += 32; continue
+                    }
+                    // 8.3 entry — assemble name from LFN if available
+                    val en = if (lfnParts.isNotEmpty()) {
+                        val full = StringBuilder()
+                        for (i in lfnParts.indices.reversed()) full.append(lfnParts[i])
+                        lfnParts.clear()
+                        full.toString()
+                    } else {
+                        val sn = String(data, off, 8, Charsets.US_ASCII).trim()
+                        val ext = String(data, off + 8, 3, Charsets.US_ASCII).trim()
+                        if (ext.isNotEmpty()) "$sn.$ext" else sn
+                    }
+                    // Skip "." and ".." entries
+                    if (en == "." || en == "..") { off += 32; continue }
+                    if (en.equals(component, ignoreCase = true)) {
+                        val lo = (data[off + 26].toInt() and 0xFF) or
+                                 ((data[off + 27].toInt() and 0xFF) shl 8)
+                        val hi = (data[off + 20].toInt() and 0xFF) or
+                                 ((data[off + 21].toInt() and 0xFF) shl 8)
+                        found = (hi shl 16) or lo
+                        break@outer
+                    }
+                    off += 32
+                }
+                val next = java.nio.ByteBuffer.wrap(
+                    reader.readSector(fatStart + (c * 4 / bytesPerSector)).getOrThrow(),
+                    (c * 4) % bytesPerSector, 4
+                ).order(java.nio.ByteOrder.LITTLE_ENDIAN).int and 0x0FFFFFFF
+                c = next
+            }
+            require(found >= 0) { "path component '$component' in '$path' not found" }
+            cluster = found
+        }
+        return cluster
+    }
+
     // ── Property: concurrent reader sees no torn writes ────────────────────
 
     @Test

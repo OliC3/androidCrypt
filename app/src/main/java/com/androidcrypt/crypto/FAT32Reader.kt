@@ -2494,6 +2494,14 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
      */
     private fun truncateToEmpty(path: String): Result<Unit> {
         return try {
+            // Clear parent directory cache before resolving file info so that
+            // getFileInfoWithCluster reads fresh data from disk (directoryCache
+            // may hold a stale entry with firstCluster=0 from before the file's
+            // data clusters were written).
+            val parentPath = path.substringBeforeLast('/', "/")
+            directoryCache.remove(normalizePath(parentPath))
+            fileCache.remove(normalizePath(path))
+
             val fileInfo = getFileInfoWithCluster(path).getOrThrow()
             if (fileInfo.isDirectory) {
                 return Result.failure(Exception("Cannot truncate a directory: $path"))
@@ -2508,7 +2516,6 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
 
             // Cache hygiene matches the tail of writeFile().
             fileCache.remove(normalizePath(path))
-            val parentPath = path.substringBeforeLast('/', "/")
             directoryCache.remove(normalizePath(parentPath))
             if (parentPath == "/" || parentPath.isEmpty()) {
                 directoryCache.remove(""); directoryCache.remove("/")
@@ -2526,46 +2533,42 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         val bs = bootSector ?: return
         val fatStartSector = bs.reservedSectors
         
-        try {
-            var cluster = firstCluster
-            val fatUpdates = mutableMapOf<Int, ByteArray>()
-            var clearedCount = 0
+        var cluster = firstCluster
+        val fatUpdates = mutableMapOf<Int, ByteArray>()
+        var clearedCount = 0
+        
+        while (cluster != 0 && cluster < 0x0FFFFFF8) {
+            // Calculate which FAT sector contains this cluster entry
+            val entryOffset = cluster * 4
+            val fatSectorOffset = entryOffset / SECTOR_SIZE
+            val offsetInSector = entryOffset % SECTOR_SIZE
             
-            while (cluster != 0 && cluster < 0x0FFFFFF8) {
-                // Calculate which FAT sector contains this cluster entry
-                val entryOffset = cluster * 4
-                val fatSectorOffset = entryOffset / SECTOR_SIZE
-                val offsetInSector = entryOffset % SECTOR_SIZE
-                
-                // Get or read FAT sector — check local map, then FAT cache, then disk
-                val fatSector = fatUpdates.getOrPut(fatSectorOffset) {
-                    fatSectorCache[fatSectorOffset]?.copyOf()
-                        ?: volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
-                }
-                
-                // Read next cluster before we overwrite
-                val nextCluster = ByteBuffer.wrap(fatSector, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                
-                // Mark cluster as free
-                ByteBuffer.wrap(fatSector, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(0)
-                clearedCount++
-                
-                cluster = nextCluster
+            // Get or read FAT sector — check local map, then FAT cache, then disk
+            val fatSector = fatUpdates.getOrPut(fatSectorOffset) {
+                fatSectorCache[fatSectorOffset]?.copyOf()
+                    ?: volumeReader.readSector((fatStartSector + fatSectorOffset).toLong()).getOrThrow()
             }
             
-            // Batch-write consecutive FAT sectors (same optimization as writeClusterChain)
-            batchWriteFATSectors(fatUpdates)
+            // Read next cluster before we overwrite
+            val nextCluster = ByteBuffer.wrap(fatSector, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).int
+            
+            // Mark cluster as free
+            ByteBuffer.wrap(fatSector, offsetInSector, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(0)
+            clearedCount++
+            
+            cluster = nextCluster
+        }
+        
+        // Batch-write consecutive FAT sectors (same optimization as writeClusterChain)
+        batchWriteFATSectors(fatUpdates)
 
-            // Keep the cached free-cluster scalar in sync with the on-disk FAT.
-            // Without this increment the cache monotonically decays (every
-            // allocateClusters() decrements but no symmetric increment ever
-            // happens), making countFreeClusters() over-report used space and
-            // eventually triggering bogus "not enough space" errors.
-            if (cachedFreeClusters >= 0 && clearedCount > 0) {
-                cachedFreeClusters += clearedCount
-            }
-        } catch (e: Exception) {
-            if (DEBUG_LOGGING) Log.e(TAG, "Failed to free clusters", e)
+        // Keep the cached free-cluster scalar in sync with the on-disk FAT.
+        // Without this increment the cache monotonically decays (every
+        // allocateClusters() decrements but no symmetric increment ever
+        // happens), making countFreeClusters() over-report used space and
+        // eventually triggering bogus "not enough space" errors.
+        if (cachedFreeClusters >= 0 && clearedCount > 0) {
+            cachedFreeClusters += clearedCount
         }
     }
     
@@ -3094,6 +3097,8 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 // Clear caches first. directoryCache + fileCache both use normalizePath() as
                 // their key, so we must normalize here too — otherwise paths containing any
                 // uppercase character leave stale entries that survive the deletion.
+                val parentPath = path.substringBeforeLast('/', "/")
+                directoryCache.remove(normalizePath(parentPath))
                 directoryCache.remove(normalizePath(path))
                 fileCache.remove(normalizePath(path))
                 
@@ -3135,12 +3140,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                     clusterChainCache.remove(fileInfo.firstCluster)
                 }
                 
-                // Clear caches - handle both "/" and "" as root path representations
-                val parentPath = path.substringBeforeLast('/', "/")
+                // Clear caches post-delete (parent was already cleared pre-delete,
+                // but directory content has changed so flush again to be safe).
                 directoryCache.remove(normalizePath(parentPath))
                 directoryCache.remove(normalizePath(path))
                 fileCache.remove(normalizePath(path))
-                // Also clear root under both possible keys
                 if (parentPath == "" || parentPath == "/") {
                     directoryCache.remove("")
                     directoryCache.remove("/")
@@ -3168,7 +3172,11 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
      */
     private fun deleteRecursive(path: String): Result<Unit> {
         try {
-            // Clear cache for this path first to get fresh info
+            // Clear caches first so getFileInfoWithCluster reads fresh data from
+            // disk (directoryCache may hold stale entries with firstCluster=0
+            // from before the file's data clusters were written).
+            val parentPath = path.substringBeforeLast('/', "/")
+            directoryCache.remove(normalizePath(parentPath))
             directoryCache.remove(normalizePath(path))
             fileCache.remove(normalizePath(path))
             
@@ -3198,12 +3206,10 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
                 clusterChainCache.remove(fileInfo.firstCluster)
             }
             
-            // Clear caches - handle both "/" and "" as root path representations
-            val parentPath = path.substringBeforeLast('/', "/")
+            // Clear caches post-delete (parent was already cleared pre-delete).
             directoryCache.remove(normalizePath(parentPath))
             directoryCache.remove(normalizePath(path))
             fileCache.remove(normalizePath(path))
-            // Also clear root under both possible keys
             if (parentPath == "" || parentPath == "/") {
                 directoryCache.remove("")
                 directoryCache.remove("/")
