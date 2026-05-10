@@ -38,8 +38,10 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
 
         // Dedicated executor for background read-ahead — runs concurrently with onRead
         // so it never blocks the calling thread waiting for the next chunk.
+        // Increased to 8 threads to handle bursty thumbnail loads (50+ simultaneous)
+        // without head-of-line blocking behind slower video prefetches.
         private val readAheadExecutor: java.util.concurrent.ExecutorService =
-            java.util.concurrent.Executors.newFixedThreadPool(4)
+            java.util.concurrent.Executors.newFixedThreadPool(8)
 
         // Dedicated executor for background writes (openDocumentForWrite).
         // Kept separate from readAheadExecutor so that a long-running write
@@ -52,7 +54,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         // threads. Instead of spawning one per file (50+ for thumbnails), we share a
         // small pool and round-robin across them.  Multiple callbacks can safely share
         // a single Looper — Android dispatches onRead/onRelease sequentially per Looper.
-        private const val PROXY_HANDLER_POOL_SIZE = 4
+        private const val PROXY_HANDLER_POOL_SIZE = 8
         private val proxyHandlerThreads: Array<HandlerThread> = Array(PROXY_HANDLER_POOL_SIZE) { i ->
             HandlerThread("ProxyPool-$i").apply { start() }
         }
@@ -693,8 +695,20 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
         private fun schedulePrefetch() {
             if (prefetchStarted) return
             prefetchStarted = true
+            // Short-circuit if the sync path in onRead already populated the cache
+            if (getCachedFile(globalCacheKey) != null) {
+                localCachedData = getCachedFile(globalCacheKey)
+                return
+            }
             readAheadExecutor.execute {
                 try {
+                    // Check again inside the executor — the sync read may have
+                    // completed between schedule and execute
+                    val existing = getCachedFile(globalCacheKey)
+                    if (existing != null) {
+                        localCachedData = existing
+                        return@execute
+                    }
                     val readStart = System.currentTimeMillis()
                     val full = fsReader.readFileRangeByCluster(
                         firstCluster, fileSize, 0, fileSize.toInt()
@@ -722,7 +736,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             path.endsWith(".avi", ignoreCase = true) || path.endsWith(".mov", ignoreCase = true) ||
             path.endsWith(".webm", ignoreCase = true) || path.endsWith(".m4v", ignoreCase = true) ||
             path.endsWith(".gif", ignoreCase = true) || // Animated GIFs need large cache window
-            path.endsWith(".valv", ignoreCase = true) // Valv encrypted video format
+            path.endsWith("-v.valv", ignoreCase = true) // Valv encrypted video format
         
         // Cache window sizing:
         //   tiny  (<= 512KB): cache the whole file — eliminates every subsequent read
@@ -840,6 +854,13 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                     Log.d(TAG, "PROXY: ${readData.size/1024}KB read in ${readTime}ms for $path")
                 }
                 
+                // Publish to global cache so in-flight async prefetch can short-circuit
+                // and future ProxyFileDescriptor instances find a hot cache immediately.
+                if (useGlobalCache) {
+                    putCachedFile(globalCacheKey, readData)
+                    localCachedData = readData
+                }
+                
                 synchronized(cacheLock) {
                     cachedData = readData
                     cachedOffset = offset
@@ -848,7 +869,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 val copySize = minOf(bytesToRead, readData.size)
                 System.arraycopy(readData, 0, data, 0, copySize)
                 
-                // Trigger read-ahead for next chunk
+                // Trigger read-ahead for next chunk (only for files larger than one cache window)
                 if (offset + readData.size < fileSize) {
                     triggerReadAhead(offset + readData.size)
                 }
