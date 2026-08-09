@@ -551,4 +551,64 @@ class FAT32OperationsTest {
         val result = fs.readFile("/nope.txt")
         assertTrue("Should fail reading nonexistent file", result.isFailure)
     }
+
+    // ── Issue #9 regression: delete must persist freed space to FSInfo ──────
+
+    @Test
+    fun `deleted file space is reclaimed after remount`() {
+        val before = fs.countFreeClusters()
+
+        // Two files so the back-to-back deletes exercise both FSInfo update
+        // paths: the first delete runs with a warm free-cluster cache
+        // (updateFSInfo absolute write), the second runs cold because the
+        // first delete invalidated the cache (addFreedClustersToFSInfo bump).
+        val dataA = ByteArray(128 * 1024) { (it % 256).toByte() }
+        val dataB = ByteArray(64 * 1024) { ((it * 3 + 1) % 256).toByte() }
+        fs.createFile("/", "a.bin").getOrThrow()
+        fs.countFreeClusters() // re-warm cache (createFile may invalidate it)
+        fs.writeFile("/a.bin", dataA).getOrThrow()
+        fs.createFile("/", "b.bin").getOrThrow()
+        fs.countFreeClusters() // re-warm cache
+        fs.writeFile("/b.bin", dataB).getOrThrow()
+        val afterWrite = fs.countFreeClusters()
+        assertTrue("writes should consume clusters", afterWrite < before)
+
+        fs.delete("/a.bin").getOrThrow()
+        fs.delete("/b.bin").getOrThrow()
+
+        // The on-disk FSInfo free count (offset 488 of the FSInfo sector)
+        // must reflect the freed clusters. allocateClusters() persists its
+        // decrements; the free path must persist its increments — otherwise
+        // the hint decays across delete → remount cycles (issue #9).
+        val bootSectorData = reader.readSector(0).getOrThrow()
+        val fsInfoSectorNum = java.nio.ByteBuffer.wrap(bootSectorData)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN).getShort(48).toInt() and 0xFFFF
+        val fsInfoData = reader.readSector(fsInfoSectorNum.toLong()).getOrThrow()
+        val onDiskFree = java.nio.ByteBuffer.wrap(fsInfoData)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt(488)
+        assertEquals(
+            "FSInfo free count must be persisted on delete (stale hint = deleted files still occupy space)",
+            before, onDiskFree
+        )
+
+        // Remount: deleted files must stay gone and the space must be back.
+        reader.unmount()
+        reader = VolumeReader(containerFile.absolutePath)
+        reader.mount(PASSWORD.toCharArray()).getOrThrow()
+        fs = FAT32Reader(reader)
+        fs.initialize().getOrThrow()
+
+        assertFalse("a.bin should be gone after remount", fs.exists("/a.bin"))
+        assertFalse("b.bin should be gone after remount", fs.exists("/b.bin"))
+        assertEquals(
+            "free clusters after remount should match the pre-write value",
+            before, fs.countFreeClusters()
+        )
+
+        // The user's actual failure mode: copying new data in after the
+        // delete+remount must succeed.
+        fs.createFile("/", "c.bin").getOrThrow()
+        fs.writeFile("/c.bin", dataA).getOrThrow()
+        assertArrayEquals(dataA, fs.readFile("/c.bin").getOrThrow())
+    }
 }

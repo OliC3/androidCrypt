@@ -2570,6 +2570,53 @@ class FAT32Reader(private val volumeReader: VolumeReader) : FileSystemReader {
         if (cachedFreeClusters >= 0 && clearedCount > 0) {
             cachedFreeClusters += clearedCount
         }
+
+        // Persist the freed count to the FSInfo sector. allocateClusters()
+        // already does this via updateFSInfo(); without a symmetric update on
+        // the free path the on-disk free count monotonically decays across
+        // delete → unmount → remount cycles: after a remount the stale
+        // (too-low) count is loaded into cachedFreeClusters, so deleted files
+        // still appear to occupy space and writeFile()'s space check rejects
+        // new copies with bogus "not enough space" errors (issue #9).
+        if (clearedCount > 0) {
+            if (cachedFreeClusters >= 0) {
+                updateFSInfo()
+            } else {
+                addFreedClustersToFSInfo(clearedCount)
+            }
+        }
+    }
+    
+    /**
+     * Add [freedCount] to the free-cluster count stored in the FSInfo sector.
+     * Used by [freeClusters] when the in-memory free-cluster cache is cold:
+     * [updateFSInfo] only writes the free count when cachedFreeClusters >= 0,
+     * so without this the freed clusters would be missing from the on-disk
+     * hint on the next mount.
+     */
+    private fun addFreedClustersToFSInfo(freedCount: Int) {
+        try {
+            val bs = bootSector ?: return
+            // Boot sector stores FSInfo sector number at offset 48
+            val bootSectorData = volumeReader.readSector(0).getOrNull() ?: return
+            val fsInfoSectorNum = ByteBuffer.wrap(bootSectorData).order(ByteOrder.LITTLE_ENDIAN).getShort(48).toInt() and 0xFFFF
+            if (fsInfoSectorNum < 1 || fsInfoSectorNum >= bs.reservedSectors) return
+
+            val fsInfoData = volumeReader.readSector(fsInfoSectorNum.toLong()).getOrNull() ?: return
+            val buf = ByteBuffer.wrap(fsInfoData).order(ByteOrder.LITTLE_ENDIAN)
+            if (buf.getInt(0) != 0x41615252 || buf.getInt(484) != 0x61417272) return
+
+            val onDiskFree = buf.getInt(488)
+            // 0xFFFFFFFF (-1) means "unknown" per the FAT32 spec — leave it
+            // alone; the next mount falls back to a full FAT scan, which
+            // already sees the freed clusters.
+            if (onDiskFree >= 0) {
+                buf.putInt(488, onDiskFree + freedCount)
+                volumeReader.writeSector(fsInfoSectorNum.toLong(), fsInfoData).getOrThrow()
+            }
+        } catch (e: Exception) {
+            if (DEBUG_LOGGING) Log.w(TAG, "Failed to add freed clusters to FSInfo", e)
+        }
     }
     
     /**
