@@ -4,7 +4,7 @@ package com.androidcrypt.crypto
  * JNI wrapper for the native XTS-Twofish implementation.
  *
  * Uses the unmodified VeraCrypt Twofish block cipher (Crypto/Twofish.c) compiled
- * into the xts_aes_native shared library, with XTS mode logic ported from
+ * into the veracrypt_crypto shared library, with XTS mode logic ported from
  * VeraCrypt's src/Common/Xts.c (identical GF(2^128) tweak derivation).
  *
  * Thread safety: the native context is read-only after creation (key schedules)
@@ -17,7 +17,7 @@ object NativeTwofishXTS {
 
     init {
         try {
-            System.loadLibrary("xts_aes_native")
+            System.loadLibrary("veracrypt_crypto")
             loaded = true
         } catch (e: UnsatisfiedLinkError) {
             // Native library not available

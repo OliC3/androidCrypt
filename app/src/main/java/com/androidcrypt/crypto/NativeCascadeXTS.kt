@@ -20,7 +20,7 @@ object NativeCascadeXTS {
 
     init {
         try {
-            System.loadLibrary("xts_aes_native")
+            System.loadLibrary("veracrypt_crypto")
             loaded = true
         } catch (e: UnsatisfiedLinkError) {
             // Native library not available

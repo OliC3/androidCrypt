@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(xts_aes_native LANGUAGES C CXX)
+project(veracrypt_crypto LANGUAGES C CXX)
 
 # Source files. Upstream VeraCrypt AES (Brian Gladman) is vendored verbatim
 # in Crypto/ — we swap the portable C block cipher; XTS framing stays in
@@ -32,32 +32,32 @@ if(ANDROID_ABI STREQUAL "arm64-v8a"
         PROPERTIES COMPILE_OPTIONS "-march=armv8-a+crypto")
 endif()
 
-add_library(xts_aes_native SHARED ${NATIVE_SOURCES})
+add_library(veracrypt_crypto SHARED ${NATIVE_SOURCES})
 
-target_include_directories(xts_aes_native PRIVATE
+target_include_directories(veracrypt_crypto PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/Crypto
     ${CMAKE_CURRENT_SOURCE_DIR}/Common
 )
 
-target_link_libraries(xts_aes_native
+target_link_libraries(veracrypt_crypto
     $<$<PLATFORM_ID:Android>:android>
     $<$<PLATFORM_ID:Android>:log>
 )
 
-set_target_properties(xts_aes_native PROPERTIES
+set_target_properties(veracrypt_crypto PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
 )
 
 # Deterministic build ID for reproducible builds (F-Droid verification)
-target_link_options(xts_aes_native PRIVATE "-Wl,--build-id=none")
+target_link_options(veracrypt_crypto PRIVATE "-Wl,--build-id=none")
 
 # Aggressive optimization for crypto hot paths.
 # CRYPTOPP_DISABLE_ASM disables Twofish.c's x64 assembly stubs and stops
 # upstream config.h from selecting any inline-ASM SSE/AVX paths — we want
 # pure portable C on x86_64 and the dedicated NEON path on arm64.
-target_compile_options(xts_aes_native PRIVATE
+target_compile_options(veracrypt_crypto PRIVATE
     -O3 -DNDEBUG
     -DCRYPTOPP_DISABLE_ASM
     # Force the vendored Streebog/Whirlpool implementations onto the

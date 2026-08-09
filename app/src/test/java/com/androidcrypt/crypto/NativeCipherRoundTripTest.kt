@@ -9,12 +9,12 @@ import org.junit.Test
  *
  * These verify that createContext → encryptSectors → decryptSectors returns
  * the original plaintext for each supported cipher.  They require the native
- * `xts_aes_native` library; if it is not available the tests are skipped.
+ * `veracrypt_crypto` library; if it is not available the tests are skipped.
  */
 class NativeCipherRoundTripTest {
 
     private val nativeAvailable: Boolean = try {
-        System.loadLibrary("xts_aes_native")
+        System.loadLibrary("veracrypt_crypto")
         true
     } catch (_: UnsatisfiedLinkError) {
         false
@@ -22,7 +22,7 @@ class NativeCipherRoundTripTest {
 
     private fun assumeNative() {
         if (!nativeAvailable) {
-            throw AssumptionViolatedException("Native library xts_aes_native not available")
+            throw AssumptionViolatedException("Native library veracrypt_crypto not available")
         }
     }
 

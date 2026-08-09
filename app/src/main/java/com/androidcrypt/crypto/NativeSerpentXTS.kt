@@ -4,7 +4,7 @@ package com.androidcrypt.crypto
  * JNI wrapper for the native XTS-Serpent implementation.
  *
  * Uses the unmodified VeraCrypt Serpent block cipher (Crypto/Serpent.c) compiled
- * into the xts_aes_native shared library, with XTS mode logic ported from
+ * into the veracrypt_crypto shared library, with XTS mode logic ported from
  * VeraCrypt's src/Common/Xts.c (identical GF(2^128) tweak derivation).
  *
  * Thread safety: the native context is read-only after creation (key schedules)
@@ -17,7 +17,7 @@ object NativeSerpentXTS {
 
     init {
         try {
-            System.loadLibrary("xts_aes_native")
+            System.loadLibrary("veracrypt_crypto")
             loaded = true
         } catch (e: UnsatisfiedLinkError) {
             // Native library not available

@@ -78,18 +78,17 @@ class HeaderRobustnessPropertyTest {
     }
 
     // ── T13 ─────────────────────────────────────────────────────────────────
-    /** Primary salt and backup salt should be different (else PBKDF2
-     *  output is identical between the two headers — which voids the
-     *  point of having a backup at all from a key-rotation standpoint).
+    /** Primary and backup volume headers must be bit-identical.
      *
-     *  KNOWN PRODUCT GAP: [VolumeCreator.createContainer] writes the same
-     *  512-byte header buffer (including its salt) at offsets 0 and
-     *  `length-128KB`. Real VeraCrypt generates an independent salt for
-     *  the backup header. Marked @Ignore until the production fix lands;
-     *  un-ignore to gate the fix.
+     *  VeraCrypt normal-volume layout: the backup header at `length-128KB`
+     *  is a literal copy of the primary header at offset 0 (same salt, same
+     *  encrypted data). The backup guards against corruption of the primary
+     *  header region — not against PBKDF2 salt faults, which would equally
+     *  destroy the primary header's salt and make the volume unrecoverable
+     *  regardless.
      */
     @Test
-    fun `primary header salt differs from backup header salt`() {
+    fun `primary and backup volume headers are identical`() {
         val total = SHARED_CONTAINER.length()
         val backupOffset = total - BACKUP_OFFSET_FROM_END
         RandomAccessFile(SHARED_CONTAINER, "r").use { raf ->
@@ -97,14 +96,9 @@ class HeaderRobustnessPropertyTest {
             raf.seek(PRIMARY_OFFSET); raf.readFully(primarySalt)
             val backupSalt = ByteArray(SALT_SIZE)
             raf.seek(backupOffset); raf.readFully(backupSalt)
-            // KNOWN GAP: this implementation reuses the same 512-byte header
-            // (including salt) for both primary and backup. Real VeraCrypt
-            // generates a fresh salt for the backup. Test asserts the
-            // spec-compliant invariant — failure here is a real product gap.
-            assertFalse(
-                "primary and backup headers share the same salt — " +
-                        "backup PBKDF2 output is identical to primary, voiding " +
-                        "the recovery purpose of the backup header",
+            assertTrue(
+                "primary and backup header salts differ — backup " +
+                        "would not be mountable with primary salt",
                 primarySalt.contentEquals(backupSalt)
             )
         }

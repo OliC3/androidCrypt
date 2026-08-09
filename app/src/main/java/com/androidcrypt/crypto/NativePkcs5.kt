@@ -12,7 +12,7 @@ package com.androidcrypt.crypto
  * support and the JCE path is well-trodden.
  *
  * The native side lives in `app/src/main/cpp/pbkdf2_native.cpp` and is
- * compiled into the same `libxts_aes_native.so` shared object as the rest
+ * compiled into the same `libveracrypt_crypto.so` shared object as the rest
  * of the crypto primitives, so loading is implicit via [System.loadLibrary]
  * already performed by [XTSMode] / native cipher initialisation.
  */
@@ -26,7 +26,7 @@ internal object NativePkcs5 {
     init {
         // Same lib used by XTSMode; loadLibrary is idempotent.
         try {
-            System.loadLibrary("xts_aes_native")
+            System.loadLibrary("veracrypt_crypto")
         } catch (_: UnsatisfiedLinkError) {
             // Tests / unusual environments load the lib through other paths
             // (e.g. NativeLibLoader for JVM unit tests).  Swallow here and

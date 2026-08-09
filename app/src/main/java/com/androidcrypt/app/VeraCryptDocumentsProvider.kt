@@ -696,8 +696,10 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
             if (prefetchStarted) return
             prefetchStarted = true
             // Short-circuit if the sync path in onRead already populated the cache
-            if (getCachedFile(globalCacheKey) != null) {
-                localCachedData = getCachedFile(globalCacheKey)
+            // with a full-file entry (size must match fileSize exactly)
+            val cached = getCachedFile(globalCacheKey)
+            if (cached != null && cached.size.toLong() == fileSize) {
+                localCachedData = cached
                 return
             }
             readAheadExecutor.execute {
@@ -705,7 +707,7 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                     // Check again inside the executor — the sync read may have
                     // completed between schedule and execute
                     val existing = getCachedFile(globalCacheKey)
-                    if (existing != null) {
+                    if (existing != null && existing.size.toLong() == fileSize) {
                         localCachedData = existing
                         return@execute
                     }
@@ -856,7 +858,11 @@ class VeraCryptDocumentsProvider : DocumentsProvider() {
                 
                 // Publish to global cache so in-flight async prefetch can short-circuit
                 // and future ProxyFileDescriptor instances find a hot cache immediately.
-                if (useGlobalCache) {
+                // ONLY publish when this read covers the ENTIRE file from byte 0 —
+                // the global cache stores full-file entries, not partial windows.
+                // Also only set localCachedData from a full-file read because the
+                // fast-path in onRead() assumes localCachedData starts at byte 0.
+                if (useGlobalCache && offset == 0L && readData.size.toLong() == fileSize) {
                     putCachedFile(globalCacheKey, readData)
                     localCachedData = readData
                 }
