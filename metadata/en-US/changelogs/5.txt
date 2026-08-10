@@ -1,0 +1,1 @@
+Mount containers created with any VeraCrypt hash (SHA-256, Whirlpool, Blake2s, Streebog), not just SHA-512. Deleting files now frees space. File names are no longer truncated when copying through external file managers. Free-space display no longer misleadingly rounds to whole GB. Various FAT32, security, and stability fixes, plus greatly expanded unit test coverage.
