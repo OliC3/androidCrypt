@@ -2336,19 +2336,22 @@ fun FileManagerScreen() {
 
 
 
-private fun formatFileSize(size: Long): String {
+internal fun formatFileSize(size: Long): String {
+    // One decimal place for KB and up — integer GB truncation made e.g.
+    // 1824 MB render as "1 GB", which looked exactly like a hidden volume's
+    // size being subtracted from the free-space display (issue #13).
     return when {
         size < 1024 -> "$size B"
-        size < 1024 * 1024 -> "${size / 1024} KB"
-        size < 1024 * 1024 * 1024 -> "${size / (1024 * 1024)} MB"
-        else -> "${size / (1024 * 1024 * 1024)} GB"
+        size < 1024 * 1024 -> "%.1f KB".format(java.util.Locale.US, size / 1024.0)
+        size < 1024L * 1024 * 1024 -> "%.1f MB".format(java.util.Locale.US, size / (1024.0 * 1024))
+        else -> "%.1f GB".format(java.util.Locale.US, size / (1024.0 * 1024 * 1024))
     }
 }
 
 /**
  * Get folder name from a document tree URI
  */
-private fun getFolderNameFromUri(context: android.content.Context, uri: Uri): String {
+internal fun getFolderNameFromUri(context: android.content.Context, uri: Uri): String {
     // For tree URIs from OpenDocumentTree, use getTreeDocumentId
     val docId = try {
         DocumentsContract.getDocumentId(uri)

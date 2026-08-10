@@ -1,3 +1,6 @@
+import org.gradle.jvm.toolchain.JavaLanguageVersion
+import org.gradle.jvm.toolchain.JavaToolchainService
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -60,6 +63,24 @@ android {
             // Make the Linux host build of libveracrypt_crypto.so visible to the JVM test runner
             val nativeLibDir = layout.projectDirectory.dir("src/test/resources/lib/linux-x86_64").asFile
             test.jvmArgs("-Djava.library.path=${nativeLibDir.absolutePath}")
+
+            // Run unit tests on JDK 17 when available. Robolectric 4.14.1's ASM
+            // cannot parse the class files of the JDK that happens to run Gradle
+            // (e.g. JDK 26 → "Unsupported class file major version 70"), and the
+            // host native lib is built against java-17 headers anyway.
+            val java17 = project.extensions.getByType(JavaToolchainService::class.java)
+                .launcherFor { languageVersion.set(JavaLanguageVersion.of(17)) }
+            if (java17.isPresent) {
+                test.javaLauncher.set(java17)
+            }
+
+            // Fresh JVM per test class. Robolectric's sandbox classloader
+            // interferes with System.loadLibrary for the native crypto lib when
+            // it shares a JVM with the plain JUnit crypto tests, leaving
+            // NativeXTS unbound (UnsatisfiedLinkError at createContext) for any
+            // crypto test that runs after a Robolectric test. Per-class forking
+            // isolates the two worlds.
+            test.forkEvery = 1
         }
     }
     compileOptions {
